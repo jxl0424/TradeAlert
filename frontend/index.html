@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>TradeAlert</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="#/">Trade<span>Alert</span></a>
+  <nav>
+    <a href="#/" data-nav="home">Scans</a>
+    <a href="#/performance" data-nav="performance">Track record</a>
+  </nav>
+  <div class="topbar-right" id="topbar-right"></div>
+</header>
+<div id="run-banner" class="run-banner" hidden></div>
+<main id="app" aria-live="polite"></main>
+<footer class="foot">TradeAlert is a screening aid, not financial advice. Verdicts are heuristics; do your own research.</footer>
+<script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+<script type="module" src="app.js"></script>
+</body>
+</html>
