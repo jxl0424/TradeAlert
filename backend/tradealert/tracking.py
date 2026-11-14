@@ -11,6 +11,9 @@ import datetime as dt
 import statistics
 from typing import Callable
 
+import warnings
+
+import numpy as np
 import pandas as pd
 
 from . import config, db
@@ -50,6 +53,90 @@ def compute_forward_outcome(bars: pd.DataFrame | None, scan_date: str, stored_en
     return out
 
 
+# --------------------------------------------------------------------------- experiment windows
+# One definition shared by forward experiments (scalar, below) and backtests (array form):
+#   entry  = open of the first bar after the signal day ("next_open") or the signal-day close ("close")
+#   window = the next `horizon` bars of the ticker, starting the bar after the signal day
+#   return = close of the last window bar / entry - 1   (mark-to-market while partial)
+#   max_gain = highest high in the window / entry - 1; max_drawdown = lowest low / entry - 1
+#   hit = max_gain >= hit threshold, only once the full window exists (status "final")
+ENTRY_MODES = ("next_open", "close")
+
+
+def window_outcome(bars: pd.DataFrame | None, signal_date: str, horizon: int, entry: str = "next_open",
+                   hit_threshold_pct: float | None = None, ref_close: float | None = None) -> dict:
+    """Outcome of one pick over `horizon` bars after `signal_date` (split-adjusted bars)."""
+    thr = (config.HIT_THRESHOLD_PCT if hit_threshold_pct is None else hit_threshold_pct) / 100.0
+    out = {"entry_date": None, "entry_price": None, "exit_date": None, "exit_price": None, "ret": None,
+           "max_gain": None, "max_drawdown": None, "hit": None, "status": "pending", "bars_available": 0}
+    if bars is None or bars.empty:
+        return out
+    day = pd.Timestamp(signal_date)
+    fwd = bars[bars.index > day]
+    n = min(len(fwd), horizon)
+    out["bars_available"] = n
+    if entry == "close":
+        # Re-read from the freshly adjusted series so later (reverse) splits don't fake a return.
+        px = fnum(bars.loc[day, "Close"]) if day in bars.index else ref_close
+        edate = day
+    else:
+        if fwd.empty:
+            return out
+        px, edate = fnum(fwd["Open"].iloc[0]), fwd.index[0]
+    if not px or px <= 0:
+        return out
+    out["entry_price"], out["entry_date"] = px, edate.strftime("%Y-%m-%d")
+    if n == 0:
+        return out
+    win = fwd.iloc[:n]
+    out["exit_price"] = float(win["Close"].iloc[-1])
+    out["exit_date"] = win.index[-1].strftime("%Y-%m-%d")
+    out["ret"] = out["exit_price"] / px - 1
+    out["max_gain"] = float(win["High"].max()) / px - 1
+    out["max_drawdown"] = float(win["Low"].min()) / px - 1
+    if n >= horizon:
+        out["status"] = "final"
+        out["hit"] = bool(out["max_gain"] >= thr)
+    else:
+        out["status"] = "partial"
+    return out
+
+
+def window_outcomes_array(o: np.ndarray, h: np.ndarray, l: np.ndarray, c: np.ndarray, horizon: int,
+                          entry: str = "next_open") -> dict[str, np.ndarray]:
+    """Vectorised `window_outcome` for every bar index of ONE ticker's own bar series.
+
+    Returns arrays (len N): entry, exit, ret, max_gain, max_drawdown (NaN when unknown),
+    n_avail (bars in the window so far). Index i is the signal day.
+    """
+    n_bars = len(c)
+    idx = np.arange(n_bars)
+    n_avail = np.clip(n_bars - 1 - idx, 0, horizon)
+    pad = np.full(horizon + 1, np.nan)
+    if entry == "close":
+        ent = c.astype(float).copy()
+    else:
+        ent = np.r_[o[1:].astype(float), np.nan]
+    ent = np.where(ent > 0, ent, np.nan)
+    hp = np.r_[h.astype(float), pad]
+    lp = np.r_[l.astype(float), pad]
+    from numpy.lib.stride_tricks import sliding_window_view
+
+    hw = sliding_window_view(hp[1:], horizon)[:n_bars]   # row i = h[i+1 : i+1+horizon]
+    lw = sliding_window_view(lp[1:], horizon)[:n_bars]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        mx = np.nanmax(hw, axis=1)
+        mn = np.nanmin(lw, axis=1)
+    exit_idx = idx + n_avail
+    ext = np.where(n_avail > 0, c.astype(float)[np.minimum(exit_idx, n_bars - 1)], np.nan)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return {
+            "entry": ent, "exit": ext, "n_avail": n_avail, "exit_idx": exit_idx,
+            "ret": ext / ent - 1, "max_gain": mx / ent - 1, "max_drawdown": mn / ent - 1,
+        }
+
+
 def last_settled_session(now: dt.datetime | None = None) -> dt.date:
     """Most recent weekday whose session has settled (holidays are not modelled)."""
     now = now or now_et()
@@ -58,6 +145,15 @@ def last_settled_session(now: dt.datetime | None = None) -> dt.date:
         d -= dt.timedelta(days=1)
     while d.weekday() >= 5:
         d -= dt.timedelta(days=1)
+    return d
+
+
+def add_trading_days(d: dt.date, n: int) -> dt.date:
+    """d + n weekdays (exchange holidays are not modelled)."""
+    while n > 0:
+        d += dt.timedelta(days=1)
+        if d.weekday() < 5:
+            n -= 1
     return d
 
 

@@ -213,7 +213,19 @@ def load_ticker_map(force: bool = False) -> dict[str, dict]:
             return json.loads(cache.read_text(encoding="utf-8"))
         except ValueError:
             pass
-    data = _sec_get_json(TICKER_MAP_URL) or {}
+    try:
+        data = _sec_get_json(TICKER_MAP_URL) or {}
+    except Exception:
+        # Fall back to the newest cached map (tickers/CIKs change rarely) before giving up.
+        older = sorted(config.CACHE_DIR.glob("sec_tickers_*.json"), reverse=True)
+        for old in older:
+            try:
+                out = json.loads(old.read_text(encoding="utf-8"))
+                log.warning("SEC ticker map download failed; using cached %s", old.name)
+                return out
+            except ValueError:
+                continue
+        raise
     rows = data.values() if isinstance(data, dict) else data
     out = {}
     for row in rows:
@@ -278,3 +290,95 @@ def filings_for_ticker(ticker: str, asof: dt.date, ticker_map: dict[str, dict]) 
         return {"cik": info["cik"], "filings": [], "risk_flags": [], "catalysts": [], "error": str(exc)}
     summary = summarize_filings(filings, asof)
     return {"cik": info["cik"], "filings": filings, **summary, "error": None}
+
+
+# --------------------------------------------------------------------------- history (backtests)
+SUBMISSIONS_CACHE = "sec_submissions"
+
+
+def _parse_acceptance_et(value: str | None) -> dt.datetime | None:
+    """EDGAR acceptanceDateTime ('2026-11-12T21:05:00.000Z', UTC) -> aware ET datetime."""
+    if not value:
+        return None
+    try:
+        ts = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=dt.timezone.utc)
+    from .utils import ET
+
+    return ts.astimezone(ET)
+
+
+def fetch_filing_history(cik: int, needed_through: dt.date) -> dict:
+    """All filings in the submissions 'recent' block for one CIK, classified, oldest first.
+
+    One request per CIK; the raw JSON is cached on disk and reused as long as it was
+    fetched after `needed_through` (older filings never change). Returns
+    {filings: [...], oldest: 'YYYY-MM-DD' | None, has_more_files: bool}.
+    """
+    config.ensure_dirs()
+    d = config.CACHE_DIR / SUBMISSIONS_CACHE
+    d.mkdir(parents=True, exist_ok=True)
+    path = d / f"CIK{cik:010d}.json"
+    data = None
+    if path.exists():
+        try:
+            cached = json.loads(path.read_text(encoding="utf-8"))
+            if dt.date.fromisoformat(cached.get("_fetched", "1900-01-01")) > needed_through:
+                data = cached
+        except (ValueError, OSError):
+            data = None
+    if data is None:
+        data = _sec_get_json(SUBMISSIONS_URL.format(cik=cik)) or {}
+        data = {"filings": {"recent": data.get("filings", {}).get("recent", {}),
+                            "files": data.get("filings", {}).get("files", [])},
+                "_fetched": now_et().date().isoformat()}
+        path.write_text(json.dumps(data), encoding="utf-8")
+    recent = data.get("filings", {}).get("recent", {})
+    forms = recent.get("form", [])
+
+    def col(name):
+        v = recent.get(name) or []
+        return v if len(v) == len(forms) else [None] * len(forms)
+
+    dates, accs, items, descs, accepted = (col("filingDate"), col("accessionNumber"), col("items"),
+                                            col("primaryDocDescription"), col("acceptanceDateTime"))
+    out = []
+    for i, form in enumerate(forms):
+        if not dates[i]:
+            continue
+        cls = classify_filing(form, items[i], descs[i])
+        acc_et = _parse_acceptance_et(accepted[i])
+        out.append({
+            "form": form, "filed_at": dates[i], "accepted_et": acc_et.isoformat() if acc_et else None,
+            "description": cls["description"], "category": cls["category"], "items": items[i] or None,
+            "flags": cls["flags"], "catalyst_items": cls["catalyst_items"], "accession": accs[i],
+        })
+    out.sort(key=lambda f: (f["filed_at"], f["accepted_et"] or ""))
+    return {"filings": out, "oldest": out[0]["filed_at"] if out else None,
+            "has_more_files": bool(data.get("filings", {}).get("files"))}
+
+
+def visible_on(filing: dict, day: dt.date) -> bool:
+    """Was this filing public before a scan of `day` could run (16:30 ET settle time)?
+
+    Uses the EDGAR acceptance time when present, so an 8-K accepted at 18:00 ET on `day`
+    only counts from the next session. Falls back to the filing date (live-scan rule).
+    """
+    acc = filing.get("accepted_et")
+    if acc:
+        ts = dt.datetime.fromisoformat(acc)
+        cutoff_h = config.MARKET_CLOSE_SETTLE_HOUR
+        cutoff = dt.datetime.combine(day, dt.time(int(cutoff_h), int(round((cutoff_h % 1) * 60))), tzinfo=ts.tzinfo)
+        return ts <= cutoff
+    return dt.date.fromisoformat(filing["filed_at"][:10]) <= day
+
+
+def filings_as_of(history: list[dict], day: dt.date, lookback_days: int | None = None) -> dict:
+    """Replay of `filings_for_ticker` as a scan on `day` would have seen it (no look-ahead)."""
+    lookback = lookback_days or config.FILINGS_LOOKBACK_DAYS
+    start = (day - dt.timedelta(days=lookback)).isoformat()
+    window = [f for f in history if f["filed_at"] >= start and visible_on(f, day)]
+    return summarize_filings(window, day)

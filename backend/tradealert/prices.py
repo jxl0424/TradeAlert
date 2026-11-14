@@ -85,8 +85,8 @@ def _is_rate_limit(msg: str) -> bool:
     return "rate" in m or "too many" in m or "429" in m
 
 
-def _cache_dir(tag: str) -> Path:
-    d = config.CACHE_DIR / "bars" / session_key() / tag
+def _cache_dir(tag: str, root: str = "bars") -> Path:
+    d = config.CACHE_DIR / root / session_key() / tag
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -102,8 +102,8 @@ def _load_cache(d: Path) -> dict[str, pd.DataFrame | None]:
     return cached
 
 
-def prune_old_cache(keep: int = 3) -> None:
-    root = config.CACHE_DIR / "bars"
+def prune_old_cache(keep: int = 3, root_name: str = "bars") -> None:
+    root = config.CACHE_DIR / root_name
     if not root.exists():
         return
     dirs = sorted([p for p in root.iterdir() if p.is_dir()], key=lambda p: p.name)
@@ -124,6 +124,7 @@ def download_bars(
     use_cache: bool = True,
     progress: Callable[[int, int], None] | None = None,
     chunk_size: int | None = None,
+    cache_root: str = "bars",
 ) -> BarMap:
     """Download daily bars for many tickers. Returns {ticker: DataFrame[Open..Volume]}.
 
@@ -133,7 +134,7 @@ def download_bars(
     tickers = sorted(set(tickers))
     chunk_size = chunk_size or config.PRICE_CHUNK_SIZE
     tag = f"start-{start}" if start else f"period-{period or config.PRICE_PERIOD}"
-    cache_dir = _cache_dir(tag) if use_cache else None
+    cache_dir = _cache_dir(tag, cache_root) if use_cache else None
     cached = _load_cache(cache_dir) if cache_dir else {}
     result: BarMap = {t: df for t, df in cached.items() if t in tickers and df is not None}
     todo = [t for t in tickers if t not in cached]
@@ -179,6 +180,27 @@ def download_bars(
         if config.PRICE_PAUSE_BETWEEN_CHUNKS:
             time.sleep(config.PRICE_PAUSE_BETWEEN_CHUNKS)
     return result
+
+
+LONG_CACHE_ROOT = "bars_long"
+
+
+def download_long_history(
+    tickers: Iterable[str],
+    period: str = "2y",
+    use_cache: bool = True,
+    progress: Callable[[int, int], None] | None = None,
+) -> BarMap:
+    """Up to 2 years of daily bars for backtests.
+
+    Same chunked/retried download as the live scan, but cached under a separate root
+    (`cache/bars_long/<session>/period-2y`), so it never touches or prunes the live scan's
+    3-month cache. Only the two most recent sessions are kept.
+    """
+    out = download_bars(tickers, period=period, use_cache=use_cache, progress=progress,
+                        cache_root=LONG_CACHE_ROOT)
+    prune_old_cache(keep=2, root_name=LONG_CACHE_ROOT)
+    return out
 
 
 def as_of_date(bars: BarMap) -> pd.Timestamp | None:

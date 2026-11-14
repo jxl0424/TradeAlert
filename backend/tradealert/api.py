@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import json
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -11,7 +12,7 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
 
-from . import config, db, scan, tracking
+from . import config, db, experiments, scan, tracking
 from .utils import clean
 
 log = logging.getLogger("tradealert")
@@ -27,6 +28,11 @@ async def lifespan(app: FastAPI):
     logging.getLogger("yfinance").setLevel(logging.CRITICAL)
     db.init_db(_db_path())
     db.mark_stale_running_scans(_db_path())
+    db.mark_stale_running_experiments(_db_path())
+    try:  # settle waiting forward experiments in the background (network)
+        experiments.evaluate_waiting_background(_db_path())
+    except Exception as exc:  # noqa: BLE001
+        log.warning("startup experiment evaluation failed: %s", exc)
     yield
 
 
@@ -115,6 +121,71 @@ def performance_refresh():
     """Re-fetch bars for past picks and fill in forward outcomes (network)."""
     result = tracking.update_outcomes(_db_path())
     return _json({**result, **tracking.performance_report(_db_path())})
+
+
+# --------------------------------------------------------------------------- experiments
+@app.get("/api/experiments/defaults")
+def experiment_defaults():
+    return _json(experiments.defaults())
+
+
+@app.get("/api/experiments")
+def experiment_list():
+    return _json([experiments.public_item(e) for e in db.list_experiments(_db_path())])
+
+
+@app.post("/api/experiments")
+async def experiment_create(request: Request):
+    """Start an experiment in a background thread -> {id, status}. 400 bad params, 409 busy."""
+    raw = await request.body()
+    try:
+        body = json.loads(raw) if raw.strip() else {}
+    except ValueError:
+        return _json({"detail": "body must be valid JSON"}, 400)
+    if not isinstance(body, dict):
+        return _json({"detail": "body must be a JSON object"}, 400)
+    kind = body.get("kind")
+    try:
+        exp_id = experiments.start(kind, body.get("params"), name=body.get("name"), db_path=_db_path())
+    except experiments.ParamError as exc:
+        return _json({"detail": str(exc)}, 400)
+    except experiments.Conflict as exc:
+        return _json({"detail": str(exc)}, 409)
+    exp = db.get_experiment(exp_id, _db_path())
+    return _json({"id": exp_id, "status": exp["status"] if exp else "running"})
+
+
+def _get_experiment_or_404(exp_id: int) -> dict:
+    exp = db.get_experiment(exp_id, _db_path())
+    if exp is None:
+        raise HTTPException(status_code=404, detail=f"experiment {exp_id} not found")
+    return exp
+
+
+@app.get("/api/experiments/{exp_id}")
+def experiment_detail(exp_id: int):
+    return _json(experiments.public_detail(_get_experiment_or_404(exp_id), _db_path()))
+
+
+@app.post("/api/experiments/{exp_id}/evaluate")
+def experiment_evaluate(exp_id: int):
+    exp = _get_experiment_or_404(exp_id)
+    if exp["kind"] != "forward":
+        return _json({"detail": "only forward experiments are evaluated later"}, 400)
+    if exp["status"] == "running":
+        return _json({"detail": "experiment is still running"}, 409)
+    if exp["status"] == "waiting":
+        experiments.evaluate_forward(exp_id, _db_path())
+    return _json(experiments.public_detail(_get_experiment_or_404(exp_id), _db_path()))
+
+
+@app.delete("/api/experiments/{exp_id}")
+def experiment_delete(exp_id: int):
+    exp = _get_experiment_or_404(exp_id)
+    if exp["status"] == "running":
+        return _json({"detail": "experiment is running; wait for it to finish"}, 409)
+    db.delete_experiment(exp_id, _db_path())
+    return _json({"deleted": exp_id})
 
 
 @app.api_route("/api/{rest:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])

@@ -64,7 +64,81 @@ CREATE TABLE IF NOT EXISTS outcomes (
     complete INTEGER DEFAULT 0,
     updated_at TEXT
 );
+
+-- Tickers that passed the price/liquidity filter in a scan (forward-experiment baseline).
+CREATE TABLE IF NOT EXISTS scan_universe (
+    scan_id INTEGER NOT NULL REFERENCES scans(id) ON DELETE CASCADE,
+    ticker TEXT NOT NULL,
+    close REAL,
+    PRIMARY KEY (scan_id, ticker)
+);
+
+-- Experiments are permanent records (never auto-deleted).
+CREATE TABLE IF NOT EXISTS experiments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL,          -- backtest | forward
+    name TEXT,
+    status TEXT NOT NULL,        -- running | waiting | completed | failed
+    params TEXT,                 -- JSON
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    finished_at TEXT,
+    due_date TEXT,
+    summary TEXT,                -- JSON
+    notes TEXT,                  -- JSON list of strings
+    error TEXT,
+    progress REAL,
+    message TEXT,
+    updated_at TEXT,             -- heartbeat while running
+    scan_id INTEGER,             -- forward: the scan the predictions came from
+    signal_date TEXT             -- forward: as-of date of that scan
+);
+
+-- Picks (is_baseline = 0) and, for forward experiments, the frozen baseline universe
+-- (is_baseline = 1). Backtest baselines are aggregated into experiments.summary.
+CREATE TABLE IF NOT EXISTS experiment_picks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    experiment_id INTEGER NOT NULL REFERENCES experiments(id) ON DELETE CASCADE,
+    is_baseline INTEGER NOT NULL DEFAULT 0,
+    signal_date TEXT NOT NULL,
+    ticker TEXT NOT NULL,
+    name TEXT,
+    score REAL,
+    verdict TEXT,
+    risk_flags TEXT,             -- JSON list of flag codes
+    details TEXT,                -- JSON: components, flags, key signals
+    ref_close REAL,              -- signal-day close at snapshot time
+    entry_date TEXT,
+    entry_price REAL,
+    exit_date TEXT,
+    exit_price REAL,
+    ret REAL,
+    max_gain REAL,
+    max_drawdown REAL,
+    hit INTEGER,
+    status TEXT NOT NULL DEFAULT 'pending',   -- pending | partial | final
+    bars_available INTEGER DEFAULT 0,
+    updated_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_experiment_picks_exp ON experiment_picks(experiment_id, is_baseline);
 """
+
+# Columns added after a table first shipped are listed here and added in place by
+# init_db (ALTER TABLE ... ADD COLUMN), so existing databases migrate without data loss.
+MIGRATION_COLUMNS: dict[str, dict[str, str]] = {
+    "experiments": {
+        "name": "TEXT", "params": "TEXT", "started_at": "TEXT", "finished_at": "TEXT", "due_date": "TEXT",
+        "summary": "TEXT", "notes": "TEXT", "error": "TEXT", "progress": "REAL", "message": "TEXT",
+        "updated_at": "TEXT", "scan_id": "INTEGER", "signal_date": "TEXT",
+    },
+    "experiment_picks": {
+        "name": "TEXT", "score": "REAL", "verdict": "TEXT", "risk_flags": "TEXT", "details": "TEXT",
+        "ref_close": "REAL", "entry_date": "TEXT", "entry_price": "REAL", "exit_date": "TEXT",
+        "exit_price": "REAL", "ret": "REAL", "max_gain": "REAL", "max_drawdown": "REAL", "hit": "INTEGER",
+        "status": "TEXT NOT NULL DEFAULT 'pending'", "bars_available": "INTEGER DEFAULT 0", "updated_at": "TEXT",
+    },
+}
+SCHEMA_VERSION = 2
 
 JSON_FIELDS = ("top_reasons", "risk_flags", "components", "signals", "bars", "news", "filings", "ai_summary")
 
@@ -88,9 +162,21 @@ def connect(db_path: Path | str | None = None) -> Iterator[sqlite3.Connection]:
 
 
 def init_db(db_path: Path | str | None = None) -> None:
+    """Create missing tables and add missing columns (in-place migration, no data loss)."""
     with connect(db_path) as conn:
         conn.execute("PRAGMA journal_mode = WAL")
         conn.executescript(SCHEMA)
+        _migrate(conn)
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    for table, cols in MIGRATION_COLUMNS.items():
+        have = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+        for col, decl in cols.items():
+            if col not in have:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+    if conn.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VERSION:
+        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
 def dumps(value: Any) -> str | None:
@@ -274,3 +360,159 @@ def all_picks_with_outcomes(db_path=None) -> list[dict]:
             "ORDER BY c.scan_date DESC, c.score DESC"
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+# --------------------------------------------------------------------------- scan universe
+def insert_scan_universe(scan_id: int, rows: list[tuple[str, float | None]], db_path=None) -> None:
+    with connect(db_path) as conn:
+        conn.executemany("INSERT OR REPLACE INTO scan_universe (scan_id, ticker, close) VALUES (?, ?, ?)",
+                         [(scan_id, t, clean(c)) for t, c in rows])
+
+
+def get_scan_universe(scan_id: int, db_path=None) -> list[dict]:
+    with connect(db_path) as conn:
+        rows = conn.execute("SELECT ticker, close FROM scan_universe WHERE scan_id = ? ORDER BY ticker",
+                            (scan_id,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+# --------------------------------------------------------------------------- experiments
+EXPERIMENT_JSON = ("params", "summary", "notes")
+PICK_JSON = ("risk_flags", "details")
+PICK_COLUMNS = (
+    "experiment_id", "is_baseline", "signal_date", "ticker", "name", "score", "verdict", "risk_flags", "details",
+    "ref_close", "entry_date", "entry_price", "exit_date", "exit_price", "ret", "max_gain", "max_drawdown",
+    "hit", "status", "bars_available",
+)
+OUTCOME_COLUMNS = ("entry_date", "entry_price", "exit_date", "exit_price", "ret", "max_gain", "max_drawdown",
+                   "hit", "status", "bars_available")
+
+
+def _exp_row(row: sqlite3.Row | None) -> dict | None:
+    if row is None:
+        return None
+    d = dict(row)
+    for f in EXPERIMENT_JSON:
+        d[f] = loads(d.get(f))
+    return d
+
+
+def create_experiment(kind: str, name: str | None, params: dict, db_path=None) -> int:
+    now = utc_now_iso()
+    with connect(db_path) as conn:
+        cur = conn.execute(
+            "INSERT INTO experiments (kind, name, status, params, created_at, started_at, updated_at, progress, "
+            "message, notes) VALUES (?, ?, 'running', ?, ?, ?, ?, 0, 'Starting', '[]')",
+            (kind, name, dumps(params), now, now, now),
+        )
+        return int(cur.lastrowid)
+
+
+def update_experiment(exp_id: int, db_path=None, **fields) -> None:
+    if not fields:
+        return
+    fields = {k: (dumps(v) if k in EXPERIMENT_JSON else clean(v)) for k, v in fields.items()}
+    fields.setdefault("updated_at", utc_now_iso())
+    cols = ", ".join(f"{k} = ?" for k in fields)
+    with connect(db_path) as conn:
+        conn.execute(f"UPDATE experiments SET {cols} WHERE id = ?", (*fields.values(), exp_id))
+
+
+def get_experiment(exp_id: int, db_path=None) -> dict | None:
+    with connect(db_path) as conn:
+        row = conn.execute("SELECT * FROM experiments WHERE id = ?", (exp_id,)).fetchone()
+    return _exp_row(row)
+
+
+def list_experiments(db_path=None, status: str | None = None, kind: str | None = None) -> list[dict]:
+    sql, args = "SELECT * FROM experiments WHERE 1=1", []
+    if status:
+        sql += " AND status = ?"
+        args.append(status)
+    if kind:
+        sql += " AND kind = ?"
+        args.append(kind)
+    with connect(db_path) as conn:
+        rows = conn.execute(sql + " ORDER BY id DESC", args).fetchall()
+    return [_exp_row(r) for r in rows]
+
+
+def delete_experiment(exp_id: int, db_path=None) -> bool:
+    with connect(db_path) as conn:
+        cur = conn.execute("DELETE FROM experiments WHERE id = ?", (exp_id,))
+        return cur.rowcount > 0
+
+
+def mark_stale_running_experiments(db_path=None, older_than_minutes: float = 15.0) -> int:
+    """Experiments whose heartbeat stopped (process exited mid-run) are marked failed."""
+    with connect(db_path) as conn:
+        cur = conn.execute(
+            "UPDATE experiments SET status='failed', error='interrupted (process exited)', "
+            "message='interrupted (process exited)', finished_at=? "
+            "WHERE status='running' AND datetime(COALESCE(updated_at, started_at)) < datetime('now', ?)",
+            (utc_now_iso(), f"-{older_than_minutes} minutes"),
+        )
+        return cur.rowcount
+
+
+def fresh_running_experiment(db_path=None, within_minutes: float = 15.0) -> dict | None:
+    """A 'running' experiment with a recent heartbeat (possibly in another process)."""
+    with connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM experiments WHERE status='running' "
+            "AND datetime(COALESCE(updated_at, started_at)) >= datetime('now', ?) ORDER BY id DESC LIMIT 1",
+            (f"-{within_minutes} minutes",),
+        ).fetchone()
+    return _exp_row(row)
+
+
+def insert_experiment_picks(exp_id: int, rows: list[dict], db_path=None) -> None:
+    now = utc_now_iso()
+    vals = []
+    for r in rows:
+        r = {"status": "pending", "bars_available": 0, "is_baseline": 0, **r, "experiment_id": exp_id}
+        if isinstance(r.get("hit"), bool):
+            r["hit"] = int(r["hit"])
+        vals.append(tuple(dumps(r.get(c)) if c in PICK_JSON else clean(r.get(c)) for c in PICK_COLUMNS) + (now,))
+    cols = ", ".join(PICK_COLUMNS) + ", updated_at"
+    with connect(db_path) as conn:
+        conn.executemany(f"INSERT INTO experiment_picks ({cols}) VALUES ({', '.join('?' for _ in range(len(PICK_COLUMNS) + 1))})",
+                         vals)
+
+
+def update_pick_outcomes(rows: list[tuple[int, dict]], db_path=None) -> None:
+    """rows: [(pick_id, outcome dict with OUTCOME_COLUMNS)]."""
+    now = utc_now_iso()
+    vals = []
+    for pid, o in rows:
+        o = dict(o)
+        if isinstance(o.get("hit"), bool):
+            o["hit"] = int(o["hit"])
+        vals.append(tuple(clean(o.get(c)) for c in OUTCOME_COLUMNS) + (now, pid))
+    cols = ", ".join(f"{c} = ?" for c in OUTCOME_COLUMNS)
+    with connect(db_path) as conn:
+        conn.executemany(f"UPDATE experiment_picks SET {cols}, updated_at = ? WHERE id = ?", vals)
+
+
+def get_experiment_picks(exp_id: int, baseline: bool = False, db_path=None, limit: int | None = None) -> list[dict]:
+    sql = ("SELECT * FROM experiment_picks WHERE experiment_id = ? AND is_baseline = ? "
+           "ORDER BY score DESC, signal_date DESC, ticker ASC")
+    args: list[Any] = [exp_id, 1 if baseline else 0]
+    if limit is not None:
+        sql += " LIMIT ?"
+        args.append(limit)
+    with connect(db_path) as conn:
+        rows = conn.execute(sql, args).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        for f in PICK_JSON:
+            d[f] = loads(d.get(f))
+        out.append(d)
+    return out
+
+
+def count_experiment_picks(exp_id: int, baseline: bool = False, db_path=None) -> int:
+    with connect(db_path) as conn:
+        return int(conn.execute("SELECT COUNT(*) FROM experiment_picks WHERE experiment_id = ? AND is_baseline = ?",
+                                (exp_id, 1 if baseline else 0)).fetchone()[0])

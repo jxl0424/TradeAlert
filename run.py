@@ -2,6 +2,10 @@
 
     python run.py scan [--limit N] [--ai-top N]   # run one scan
     python run.py serve [--port 8000]             # start the dashboard/API
+    python run.py experiment backtest [--start YYYY-MM-DD --end YYYY-MM-DD --horizon 5 --top-n 10 ...]
+    python run.py experiment forward [--scan-id N | --fresh-scan] [--verdicts STRONG,WATCH ...]
+    python run.py experiment evaluate [--id N]    # settle waiting forward experiments now
+    python run.py experiment list | show N
 """
 from __future__ import annotations
 
@@ -13,10 +17,14 @@ sys.path.insert(0, str(BACKEND))
 
 
 def main() -> int:
-    if len(sys.argv) < 2 or sys.argv[1] not in ("scan", "serve"):
+    if len(sys.argv) < 2 or sys.argv[1] not in ("scan", "serve", "experiment"):
         print(__doc__)
         return 2
     cmd, rest = sys.argv[1], sys.argv[2:]
+    if cmd == "experiment":
+        from tradealert.experiments import main as experiment_main
+
+        return experiment_main(rest)
     if cmd == "scan":
         from tradealert.scan import main as scan_main
 

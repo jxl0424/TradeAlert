@@ -114,6 +114,8 @@ def run_scan(limit: int | None = None, shortlist_size: int | None = None, ai_top
         scan_date = asof.isoformat()
         filtered = prices.filter_tradeable(bars, asof=asof_ts)
         db.update_scan(scan_id, db_path, scan_date=scan_date, filtered_size=len(filtered))
+        # Persist the filtered universe: forward experiments use it as their baseline.
+        db.insert_scan_universe(scan_id, [(t, float(df["Close"].iloc[-1])) for t, df in filtered.items()], db_path)
         state.update(stage="signals", progress=0.62,
                      message=f"Bars for {len(bars)} symbols (as of {scan_date}); {len(filtered)} pass price/liquidity filters")
 
@@ -222,6 +224,14 @@ def run_scan(limit: int | None = None, shortlist_size: int | None = None, ai_top
             log.info("tracking: %s", tr)
         except Exception as exc:  # noqa: BLE001
             warnings.append(f"tracking update failed: {exc}")
+        try:
+            from . import experiments
+
+            ev = experiments.evaluate_waiting(db_path, known_bars=bars)
+            if ev:
+                log.info("forward experiments evaluated: %s", ev)
+        except Exception as exc:  # noqa: BLE001
+            warnings.append(f"experiment evaluation failed: {exc}")
 
         elapsed = time.monotonic() - t0
         msg = (f"Scanned {len(secs)} symbols, {len(filtered)} passed filters, {len(candidates)} candidates "
