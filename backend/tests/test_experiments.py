@@ -120,14 +120,14 @@ def test_no_lookahead_spike_on_next_day_does_not_change_selection():
     res_a = backtest.run_backtest(bars, p)
     day = next(iter(bars.values())).index[100]
     d = day.strftime("%Y-%m-%d")
-    # Tamper with EVERY bar after D for one ticker that was not picked on D: a 5x spike.
+    # A huge spike on D+1 (high, close, volume; the D+1 open = entry is unchanged) for a ticker
+    # that was NOT picked on D must not change D's (or any earlier day's) scores or picks.
     picked_a = {x["ticker"] for x in res_a["picks"] if x["signal_date"] == d}
     victim = next(t for t in sorted(bars) if t not in picked_a)
     tampered = {t: df.copy() for t, df in bars.items()}
-    after = tampered[victim].index > day
-    for col in ("Open", "High", "Low", "Close"):
-        tampered[victim].loc[after, col] *= 5
-    tampered[victim].loc[after, "Volume"] *= 50
+    nxt = tampered[victim].index[101]
+    tampered[victim].loc[nxt, ["High", "Close"]] *= 5
+    tampered[victim].loc[nxt, "Volume"] *= 50
     res_b = backtest.run_backtest(tampered, p)
 
     def day_picks(res, upto):
@@ -205,8 +205,11 @@ def test_filings_replay_respects_dates_and_acceptance_time():
     res = backtest.run_backtest(bars, bt_params(bars, 95, 110, top_n=6, include_filings=True),
                                 filings_provider=provider)
     before = [x for x in res["picks"] if x["signal_date"] <= D.isoformat()]
-    after = [x for x in res["picks"] if x["signal_date"] > D.isoformat()]
-    assert before and after
+    fresh_end = (D + dt.timedelta(days=10)).isoformat()  # flags older than 10 days are downgraded
+    after = [x for x in res["picks"] if D.isoformat() < x["signal_date"] <= fresh_end]
+    later = [x for x in res["picks"] if x["signal_date"] > fresh_end]
+    assert before and after and later
+    assert all(x["verdict"] != "AVOID" and "DILUTION_PROSPECTUS" in x["risk_flags"] for x in later)
     assert all(x["verdict"] != "AVOID" or "DILUTION_PROSPECTUS" not in x["risk_flags"] for x in before)
     assert all(x["verdict"] == "AVOID" and "DILUTION_PROSPECTUS" in x["risk_flags"] for x in after)
     assert any("SEC filings replayed" in n for n in res["notes"])
@@ -465,6 +468,7 @@ def test_api_experiments_flow(client, tmp_db, monkeypatch):
 
     d = client.get("/api/experiments/defaults").json()
     assert set(d) == {"backtest", "forward"} and "ranges" in d["backtest"] and "params" in d["forward"]
+    assert d["backtest"]["defaults"] == d["backtest"]["params"] and d["backtest"]["ranges"]["top_n"]["max"] == 50
     assert client.post("/api/experiments", json={"kind": "bogus"}).status_code == 400
     assert client.post("/api/experiments", json={"kind": "backtest", "params": {"top_n": 0}}).status_code == 400
     assert client.post("/api/experiments", content=b"{nope", headers={"content-type": "application/json"}

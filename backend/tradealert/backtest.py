@@ -133,7 +133,7 @@ def build_rows(bars: dict[str, pd.DataFrame], start: dt.date, end: dt.date, hori
         part["ticker"] = t
         part["signal_date"] = idx[mask]
         ent_idx = np.flatnonzero(mask) + (0 if entry == "close" else 1)
-        dates = np.r_[idx.values, np.datetime64("NaT")]
+        dates = np.r_[idx.values, np.datetime64("NaT", "ns")]
         part["entry_date"] = dates[np.minimum(ent_idx, len(idx))]
         part["exit_date"] = dates[np.where(oc["n_avail"][mask] > 0, oc["exit_idx"][mask], len(idx))]
         for key in ("entry", "exit", "ret", "max_gain", "max_drawdown", "n_avail"):

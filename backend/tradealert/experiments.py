@@ -64,6 +64,14 @@ def backtest_date_bounds(horizon: int = 5) -> dict:
 
 
 def defaults() -> dict:
+    """{kind: {params, defaults (same as params), ranges}} for the dashboard form."""
+    out = _defaults()
+    for v in out.values():
+        v["defaults"] = dict(v["params"])
+    return out
+
+
+def _defaults() -> dict:
     b = backtest_date_bounds(5)
     return {
         "backtest": {
@@ -143,7 +151,7 @@ def validate_params(kind: str, params: dict | None, db_path=None) -> dict:
     if params is not None and not isinstance(params, dict):
         raise ParamError("params must be an object")
     params = dict(params or {})
-    allowed = set(defaults()[kind]["params"])
+    allowed = set(_defaults()[kind]["params"])
     unknown = sorted(set(params) - allowed)
     if unknown:
         raise ParamError(f"unknown parameter(s) for {kind}: {', '.join(unknown)}")

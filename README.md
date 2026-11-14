@@ -108,6 +108,96 @@ start a scan from the dashboard (`POST /api/scans/run`) and follow it through
 
 Returns are fractions (0.25 means +25%). Missing numbers are `null`.
 
+## Experiments: are the recommendations any good?
+
+An experiment tests the tool's picks against a **baseline**: every stock that passed the same
+price/liquidity filter on the same days (the picks are part of it). The question an experiment
+answers is not "did the picks go up?" but "did the picks do better than just picking any filtered
+penny stock that day?". Penny stocks spike often, so a 15% hit rate means nothing unless the baseline
+is clearly lower. Every experiment is stored permanently in `data/tradealert.db` and shown in the
+dashboard; nothing deletes them except an explicit delete.
+
+Two kinds:
+
+- **Backtest** (history run). The scanner is replayed over a past date range on up to 2 years of
+  daily bars (a separate long-history download, cached under `data/cache/bars_long/`, which does
+  not touch the live scan cache). For each trading day D, only bars up to D are used: the live
+  filter as of D, the same signals on the trailing 65 bars (the live 3-month window), the live
+  top-40 technical shortlist, SEC filings replayed as of D (catalyst points, dilution/AVOID flags;
+  a filing counts on D only if EDGAR accepted it by 16:30 ET), then the top N by score. Each pick
+  is bought at D+1's open (or D's close) and held for the next `horizon_days` bars.
+  The first full-universe run downloads about 6,000 symbols (roughly 10 to 15 minutes); the replay
+  itself takes a minute or two.
+- **Forward** (prediction, then wait). The picks of a completed scan (or a fresh scan) are frozen
+  now, together with the full filtered universe of that scan as the baseline. It shows `waiting`
+  until the window has passed, with mark-to-market results on the bars so far. It is evaluated
+  automatically at the end of every scan, when the server starts, and on demand
+  (`POST /api/experiments/{id}/evaluate` or `python run.py experiment evaluate`).
+
+```powershell
+python run.py experiment backtest                                  # last ~6 months, defaults
+python run.py experiment backtest --start 2026-03-02 --end 2026-09-30 --horizon 5 --top-n 10
+python run.py experiment forward                                   # from the latest scan
+python run.py experiment forward --fresh-scan --verdicts STRONG,WATCH
+python run.py experiment evaluate                                  # settle waiting forward tests
+python run.py experiment list
+```
+
+### Reading the results
+
+- `hit_rate`: share of picks whose highest high in the window reached the hit threshold
+  (default +20%) over the entry price. `avg_return` / `median_return`: close at the end of the
+  window vs entry. `win_rate`: share with a positive close return. `avg_max_drawdown`: average of
+  the lowest low vs entry (how much pain you sat through).
+- Compare every number with the **baseline** on the same days. `by_verdict` and `by_month` rows
+  carry `baseline_hit_rate` / `baseline_avg_return` for the same signal days. `edge` is picks minus
+  baseline. If STRONG picks do not beat the baseline clearly, and in more than one period, the
+  score has no proven edge, whatever the absolute numbers look like.
+- A high hit rate together with a negative average return is common for penny stocks: they spike
+  intraday and fade. The hit rate assumes you sold at the high, which nobody does reliably.
+- The `equity_curve` puts 1/horizon of the capital into each day's picks (equal weight) for the
+  window, compounded. It is an illustration, not a tradable strategy (no costs, no slippage).
+- While a forward experiment is waiting, return figures are mark-to-market (`basis: "partial"`)
+  and `hit` stays `null` until the full window exists.
+
+### Caveats (also stored in each experiment's notes)
+
+- **Survivorship bias**: the backtest replays today's listed symbols only. Stocks that were
+  delisted, went bankrupt or were acquired during the period are missing. This flatters both picks
+  and baseline, more so for penny stocks.
+- **Split-adjusted prices**: a stock that later did a 1:10 reverse split shows 10x its real price
+  historically and may wrongly fail the $0.10-$5 filter, and forward splits the reverse. Which
+  stocks looked like penny stocks back then is approximate.
+- **Not available historically**: float and short interest (15 of 100 points), news (half of the
+  catalyst points), NASDAQ status, reverse-split and market-cap flags. The backtest score is the
+  available components (volume, momentum, setup, plus the SEC-filing half of catalyst) rescaled
+  to 0-100, with the normal penalties and verdict thresholds. It is close to, but not the same as,
+  the live score.
+- **Fills**: buying at the next open is optimistic for illiquid names (spread, gaps, slippage),
+  and no commissions are modelled. Free Yahoo data has occasional bad prints that can inflate
+  the max gain.
+- A forward experiment from one scan is a small sample. Look at many of them, or at a backtest.
+- Exchange holidays are not modelled in the forward `due_date`; evaluation simply waits for bars.
+- SEC filing history comes from EDGAR's "recent" block (the last ~1,000 filings per company),
+  which covers two years for nearly every penny stock. It needs `SEC_USER_AGENT`; without it the
+  backtest runs without filings and says so in its notes.
+
+### Experiments API
+
+| Method and path | Purpose |
+|---|---|
+| `GET /api/experiments/defaults` | default params and allowed ranges for both kinds (for the form) |
+| `POST /api/experiments` | `{kind: "backtest"\|"forward", name?, params}` starts a background run and returns `{id, status}`. 400 bad params, 409 if a scan or experiment is computing |
+| `GET /api/experiments` | newest first, with `status`, `progress`, `message`, `headline` |
+| `GET /api/experiments/{id}` | adds `notes`, `error`, `summary` (overall, baseline, by_verdict, by_month, equity_curve) and `picks` (top 2,000 by score, plus `picks_total`) |
+| `POST /api/experiments/{id}/evaluate` | re-evaluate a waiting forward experiment now |
+| `DELETE /api/experiments/{id}` | delete (409 while running) |
+
+Backtest params: `start_date`, `end_date`, `horizon_days` (5), `hit_threshold_pct` (20), `top_n` (10),
+`min_score` (0), `entry` (`next_open` or `close`), `include_filings` (true). Forward params: `scan_id`
+(default: the latest completed scan) or `run_fresh_scan`, `verdicts` (STRONG, WATCH), `min_score`,
+`horizon_days`, `hit_threshold_pct`, `entry`.
+
 ## Schedule it daily (Windows Task Scheduler)
 
 Run the scan after the US close has settled (after 16:30 ET; for example 17:30 ET, or
@@ -157,5 +247,5 @@ python -m pytest            # unit and API tests, no network
 ```
 
 Layout: `backend/tradealert/` (`config`, `db`, `universe`, `prices`, `signals`, `scoring`,
-`fundamentals`, `filings`, `news`, `ai_summary`, `tracking`, `scan`, `api`) and
+`fundamentals`, `filings`, `news`, `ai_summary`, `tracking`, `scan`, `experiments`, `backtest`, `api`) and
 `backend/tests/`. Data and caches go to `data/` (git-ignored).
