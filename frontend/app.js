@@ -120,7 +120,7 @@ const sortFlags = (f) => [...(f || [])].sort((a, b) => SEV_ORDER[sevOf(a.severit
 /* ---------- state ---------- */
 const state = {
   scans: [], scanId: null, health: null,
-  filters: { verdict: '', minScore: '', q: '', hideAvoid: false },
+  filters: { verdict: '', minScore: '', q: '', hideAvoid: false, showAll: false },
   sort: { key: 'score', dir: -1 },
   perfSort: { key: 'scan_date', dir: -1 },
   running: false, pollTimer: null, expTimer: null, pk: null,
@@ -259,7 +259,9 @@ async function viewList(token) {
   }
   const data = await api(`/api/candidates?scan_id=${encodeURIComponent(state.scanId)}`);
   if (token !== renderToken) return;
-  const all = data.candidates || [];
+  const everything = data.candidates || [];
+  const TOP_N = 10;
+  const top = [...everything].sort((a, b) => (isNum(b.score) ? b.score : -1) - (isNum(a.score) ? a.score : -1)).slice(0, TOP_N);
   const scan = data.scan || {};
   app.innerHTML = `
     <div class="toolbar">
@@ -267,6 +269,7 @@ async function viewList(token) {
       <label>Min score <input id="f-min" type="number" min="0" max="100" style="width:64px" value="${esc(state.filters.minScore)}"></label>
       <label>Search <input id="f-q" type="search" placeholder="Ticker or name" value="${esc(state.filters.q)}"></label>
       <label><input id="f-hide" type="checkbox" ${state.filters.hideAvoid ? 'checked' : ''}> Hide AVOID</label>
+      ${everything.length > TOP_N ? `<label><input id="f-all" type="checkbox" ${state.filters.showAll ? 'checked' : ''}> Show all ${everything.length}</label>` : ''}
       <span class="count" id="count"></span>
     </div>
     <div class="table-wrap"><table class="clickable"><thead><tr>${headerCells(COLS, state.sort)}</tr></thead><tbody id="rows"></tbody></table></div>
@@ -274,6 +277,7 @@ async function viewList(token) {
 
   const draw = () => {
     const f = state.filters;
+    const all = f.showAll ? everything : top;
     const min = f.minScore === '' ? null : Number(f.minScore);
     const q = f.q.trim().toLowerCase();
     let rows = all.filter((c) =>
@@ -282,7 +286,7 @@ async function viewList(token) {
       (!f.hideAvoid || c.verdict !== 'AVOID') &&
       (!q || (c.ticker || '').toLowerCase().includes(q) || (c.name || '').toLowerCase().includes(q)));
     rows = sortRows(rows, COLS, state.sort);
-    $('#count').textContent = `${rows.length} of ${all.length} candidates`;
+    $('#count').textContent = f.showAll || everything.length <= TOP_N ? `${rows.length} of ${all.length} candidates` : `${rows.length} shown · top ${all.length} by score`;
     $('#rows').innerHTML = rows.length ? rows.map(rowHtml).join('') : `<tr><td colspan="${COLS.length}" class="empty">${all.length ? 'No candidates match these filters.' : 'This scan produced no candidates.'}</td></tr>`;
   };
   draw();
@@ -290,6 +294,7 @@ async function viewList(token) {
   $('#f-min').oninput = (e) => { state.filters.minScore = e.target.value; draw(); };
   $('#f-q').oninput = (e) => { state.filters.q = e.target.value; draw(); };
   $('#f-hide').onchange = (e) => { state.filters.hideAvoid = e.target.checked; draw(); };
+  if ($('#f-all')) $('#f-all').onchange = (e) => { state.filters.showAll = e.target.checked; draw(); };
   $('thead').onclick = (e) => {
     const th = e.target.closest('th[data-sort]'); if (!th) return;
     const k = th.dataset.sort;
