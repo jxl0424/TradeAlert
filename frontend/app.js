@@ -43,13 +43,15 @@ const pctCell = (n, d) => `<span class="${signCls(n)}">${fmt.pct(n, d)}</span>`;
 async function api(path, opts) {
   const res = await fetch(path, opts);
   if (!res.ok) {
-    let detail = '';
-    try { const j = await res.json(); detail = j.detail || j.message || ''; } catch {}
+    let detail = '', raw;
+    try { const j = await res.json(); raw = j.detail ?? j.message; detail = j.detail || j.message || ''; } catch {}
     const e = new Error(`${res.status} ${res.statusText}${detail ? ': ' + (typeof detail === 'string' ? detail : JSON.stringify(detail)) : ''}`);
     e.status = res.status;
+    e.detail = raw;
     throw e;
   }
-  return res.json();
+  const txt = await res.text();
+  return txt ? JSON.parse(txt) : null;
 }
 
 const verdictBadge = (v, big) => {
@@ -66,7 +68,7 @@ const state = {
   filters: { verdict: '', minScore: '', q: '', hideAvoid: false },
   sort: { key: 'score', dir: -1 },
   perfSort: { key: 'scan_date', dir: -1 },
-  running: false, pollTimer: null,
+  running: false, pollTimer: null, expTimer: null, pk: null,
 };
 let renderToken = 0;
 
@@ -141,12 +143,15 @@ async function loadMeta(selectNewest) {
 /* ---------- router ---------- */
 function render() {
   const hash = location.hash || '#/';
-  document.querySelectorAll('[data-nav]').forEach((a) => a.classList.toggle('active', (hash.startsWith('#/performance') ? 'performance' : 'home') === a.dataset.nav));
+  document.querySelectorAll('[data-nav]').forEach((a) => a.classList.toggle('active', (hash.startsWith('#/performance') ? 'performance' : hash.startsWith('#/experiments') ? 'experiments' : 'home') === a.dataset.nav));
   const token = ++renderToken;
   destroyChart();
+  stopExpTimer();
   let p;
   if (hash.startsWith('#/t/')) p = viewDetail(decodeURIComponent(hash.slice(4)).toUpperCase(), token);
   else if (hash.startsWith('#/performance')) p = viewPerformance(token);
+  else if (hash.startsWith('#/experiments/')) p = viewExperiment(decodeURIComponent(hash.slice(14)), token);
+  else if (hash.startsWith('#/experiments')) p = viewExperiments(token);
   else p = viewList(token);
   p.catch((e) => { if (token === renderToken) app.innerHTML = `<div class="error">Failed to load: ${esc(e.message)}</div>`; });
 }
@@ -408,6 +413,572 @@ async function viewPerformance(token) {
     state.perfSort = { key: k, dir: state.perfSort.key === k ? -state.perfSort.dir : (PCOLS.find((c) => c.key === k).text ? 1 : -1) };
     $('thead tr').innerHTML = headerCells(PCOLS, state.perfSort); draw();
   };
+}
+
+/* ---------- experiments ---------- */
+const KIND_LABEL = { backtest: 'History run', forward: 'Forward test' };
+const kindLabel = (k) => KIND_LABEL[k] || 'Experiment';
+const STATUS_LABEL = { running: 'Running', waiting: 'Waiting', completed: 'Completed', failed: 'Failed' };
+const statusBadge = (s) => `<span class="badge st-${STATUS_LABEL[s] ? s : 'other'}">${esc(STATUS_LABEL[s] || s || 'Unknown')}</span>`;
+const expName = (e) => e.name || `${kindLabel(e.kind)} #${e.id}`;
+const MIN_EVALUATED = 20;
+const ENTRY_LABEL = { next_open: "the next trading day's open", close: 'the close of the signal day' };
+const stopExpTimer = () => { clearTimeout(state.expTimer); state.expTimer = null; };
+const expHref = (id) => '#/experiments/' + encodeURIComponent(id);
+
+function detailText(e) {
+  const d = e && e.detail;
+  if (Array.isArray(d)) return d.map((x) => (x && x.msg ? `${Array.isArray(x.loc) ? x.loc.filter((l) => l !== 'body' && l !== 'params').join('.') + ': ' : ''}${x.msg}` : String(x))).join('; ');
+  if (d && typeof d === 'object') return JSON.stringify(d);
+  return d ? String(d) : (e && e.message) || 'Unknown error';
+}
+
+/* Plain-words verdict: only meaningful for completed experiments. */
+function expVerdict(h, status) {
+  if (status !== 'completed') return null;
+  if (!h || !isNum(h.evaluated) || h.evaluated < MIN_EVALUATED) {
+    return { cls: 'few', icon: '?', label: 'Too few picks to judge', why: `Only ${isNum(h && h.evaluated) ? h.evaluated : 0} scored picks; at least ${MIN_EVALUATED} are needed.` };
+  }
+  const sgn = (a, b, tol) => (isNum(a) && isNum(b) ? (a - b > tol ? 1 : a - b < -tol ? -1 : 0) : null);
+  const ss = [sgn(h.hit_rate, h.baseline_hit_rate, 0.02), sgn(h.avg_return, h.baseline_avg_return, 0.005)].filter((x) => x !== null);
+  if (!ss.length) return { cls: 'few', icon: '?', label: 'No baseline to compare', why: 'The baseline numbers are missing.' };
+  const pos = ss.includes(1), neg = ss.includes(-1);
+  if (pos && neg) return { cls: 'mixed', icon: '≈', label: 'Mixed against baseline', why: 'One measure is better than baseline and the other is worse.' };
+  if (pos) return { cls: 'beat', icon: '▲', label: 'Beat baseline', why: 'Picks did better than all penny stocks on the same days.' };
+  if (neg) return { cls: 'worse', icon: '▼', label: 'Worse than baseline', why: 'Picks did worse than all penny stocks on the same days.' };
+  return { cls: 'none', icon: '≈', label: 'No edge over baseline', why: 'Picks did about as well as all penny stocks on the same days.' };
+}
+const verdictChip = (v) => (v ? `<span class="vd vd-${v.cls}" title="${esc(v.why)}"><span aria-hidden="true">${v.icon}</span> ${esc(v.label)}</span>` : '');
+
+function describeParams(kind, p) {
+  p = p || {};
+  const hit = `A pick counts as a hit if its price rose at least ${isNum(p.hit_threshold_pct) ? esc(p.hit_threshold_pct) : '—'}% within ${isNum(p.horizon_days) ? esc(p.horizon_days) : '—'} trading days.`;
+  const entry = ENTRY_LABEL[p.entry] ? `Entry at ${ENTRY_LABEL[p.entry]}.` : '';
+  if (kind === 'backtest') {
+    return `Replayed the scanner from <b>${fmt.date(p.start_date)}</b> to <b>${fmt.date(p.end_date)}</b>, taking the top ${isNum(p.top_n) ? esc(p.top_n) : '—'} picks per day that scored at least ${isNum(p.min_score) ? esc(p.min_score) : '—'}. ${entry} ${hit} SEC filings ${p.include_filings === false ? 'were not used' : 'were used'} in scoring.`;
+  }
+  const src = p.run_fresh_scan ? 'a fresh scan run at the start' : (p.scan_id !== null && p.scan_id !== undefined ? `scan #${esc(p.scan_id)}` : 'the latest scan');
+  const vs = Array.isArray(p.verdicts) && p.verdicts.length ? p.verdicts.map(esc).join(' and ') : 'all';
+  return `Froze the predictions from ${src}: ${vs} verdicts${isNum(p.min_score) ? `, score at least ${esc(p.min_score)}` : ''}. ${entry} Each is scored after ${isNum(p.horizon_days) ? esc(p.horizon_days) : '—'} trading days. ${hit}`;
+}
+
+const progressBar = (prog) => {
+  if (!isNum(prog)) return '<div class="progress indet" role="progressbar" aria-label="Working"><div></div></div>';
+  const pct = Math.max(0, Math.min(100, Math.round(prog * 100)));
+  return `<div class="progress" role="progressbar" aria-valuenow="${pct}" aria-valuemin="0" aria-valuemax="100"><div style="width:${pct}%"></div></div>`;
+};
+
+/* ---- list ---- */
+function headlineHtml(h) {
+  if (!h) return '<p class="muted">No results recorded.</p>';
+  const row = (label, a, b, signed) => `<div class="hl-row"><span class="hl-l">${label}</span>
+    <span class="hl-v"><b>${signed ? pctCell(a) : fmt.pctPlain(a, 0)}</b><small>picks</small></span>
+    <span class="hl-v base"><b>${signed ? pctCell(b) : fmt.pctPlain(b, 0)}</b><small>baseline</small></span></div>`;
+  return `<div class="hl">${row('Hit rate', h.hit_rate, h.baseline_hit_rate, false)}${row('Avg return', h.avg_return, h.baseline_avg_return, true)}
+    <div class="hl-n muted">${fmt.int(h.evaluated)} of ${fmt.int(h.picks)} picks scored</div></div>`;
+}
+
+function expCard(e) {
+  const v = expVerdict(e.headline, e.status);
+  let body = '';
+  if (e.status === 'running') body = `<div class="exp-run">${progressBar(e.progress)}<div class="muted">${esc(e.message) || 'Working…'}${isNum(e.progress) ? ` (${Math.round(e.progress * 100)}%)` : ''}</div></div>`;
+  else if (e.status === 'waiting') body = `<p class="exp-wait"><b>Results due ${fmt.date(e.due_date)}</b><span class="muted">${e.headline && isNum(e.headline.picks) ? ` · ${fmt.int(e.headline.picks)} picks frozen` : ''}</span></p>`;
+  else if (e.status === 'failed') body = `<p class="down exp-fail">${esc(e.message) || 'This experiment failed.'}</p>`;
+  else body = headlineHtml(e.headline);
+  return `<article class="exp-card" data-id="${esc(e.id)}">
+    <div class="exp-top"><a class="exp-name" href="${esc(expHref(e.id))}">${esc(expName(e))}</a>${statusBadge(e.status)}</div>
+    <div class="exp-meta muted"><span class="kind-tag">${esc(kindLabel(e.kind))}</span> · Created ${fmt.dt(e.created_at)}</div>
+    ${v ? `<div class="exp-verdict">${verdictChip(v)}</div>` : ''}
+    ${body}</article>`;
+}
+
+function emptyExperiments() {
+  return `<div class="panel empty"><h2>No experiments yet</h2>
+    <p>Experiments test whether TradeAlert's picks are any good, by comparing them with all penny stocks on the same days.</p>
+    <div class="kind-explain">
+      <div><b>History run</b><p>Replays the scanner over a past date range and measures what its picks did afterwards. Quick, but uses hindsight data.</p></div>
+      <div><b>Forward test</b><p>Freezes today's predictions, waits (5 trading days by default), then marks each one right or wrong. Slower, but no hindsight.</p></div>
+    </div>
+    <p><button class="primary big" data-new-exp>New experiment</button></p></div>`;
+}
+
+async function viewExperiments(token) {
+  app.innerHTML = `<div class="page-head"><div><h2 style="margin:0">Experiments</h2>
+      <p class="note" style="margin:2px 0 0">Is the tool's advice any good? Each experiment compares its picks with all penny stocks on the same days.</p></div>
+      <button class="primary big" data-new-exp>New experiment</button></div>
+    <div id="exp-list"><p class="muted">Loading…</p></div>`;
+  app.querySelectorAll('[data-new-exp]').forEach((b) => { b.onclick = () => openNewExperiment(); });
+  let last = null;
+  const load = async (first) => {
+    let list;
+    try { list = await api('/api/experiments'); }
+    catch (e) {
+      if (token !== renderToken) return;
+      if (first) { $('#exp-list').innerHTML = `<div class="error">Failed to load experiments: ${esc(e.message)}</div>`; return; }
+      state.expTimer = setTimeout(() => load(false), 5000); return;
+    }
+    if (token !== renderToken) return;
+    if (!Array.isArray(list)) list = [];
+    const sig = JSON.stringify(list);
+    if (sig !== last) {
+      last = sig;
+      $('#exp-list').innerHTML = list.length ? `<div class="exp-grid">${list.map(expCard).join('')}</div>` : emptyExperiments();
+      app.querySelectorAll('#exp-list [data-new-exp]').forEach((b) => { b.onclick = () => openNewExperiment(); });
+      app.querySelectorAll('.exp-card').forEach((c) => { c.onclick = (ev) => { if (!ev.target.closest('a,button')) location.hash = expHref(c.dataset.id); }; });
+    }
+    stopExpTimer();
+    if (list.some((e) => e.status === 'running')) state.expTimer = setTimeout(() => load(false), 2000);
+  };
+  await load(true);
+}
+
+/* ---- new experiment dialog ---- */
+const FALLBACK_DEFAULTS = {
+  backtest: { horizon_days: 5, hit_threshold_pct: 20, top_n: 10, min_score: 45, entry: 'next_open', include_filings: true },
+  forward: { run_fresh_scan: false, verdicts: ['STRONG', 'WATCH'], horizon_days: 5, hit_threshold_pct: 20, entry: 'next_open' },
+};
+async function loadExpDefaults() {
+  let resp = null, ok = false;
+  try { resp = await api('/api/experiments/defaults'); ok = true; } catch {}
+  const out = { backtest: { defaults: {}, ranges: {} }, forward: { defaults: {}, ranges: {} }, fromServer: ok };
+  for (const k of ['backtest', 'forward']) {
+    const x = resp && typeof resp === 'object' ? resp[k] : null;
+    let d = {}, r = {};
+    if (x && typeof x === 'object') {
+      d = x.defaults && typeof x.defaults === 'object' ? x.defaults : x;
+      r = x.ranges && typeof x.ranges === 'object' ? x.ranges : {};
+    }
+    if (resp && resp.ranges && typeof resp.ranges === 'object' && resp.ranges[k] && typeof resp.ranges[k] === 'object') r = { ...resp.ranges[k], ...r };
+    const clean = {};
+    for (const [key, val] of Object.entries(d)) if (val !== null && val !== undefined && typeof val !== 'object' || key === 'verdicts') clean[key] = val;
+    out[k].defaults = { ...FALLBACK_DEFAULTS[k], ...clean };
+    if (!Array.isArray(out[k].defaults.verdicts) && k === 'forward') out[k].defaults.verdicts = FALLBACK_DEFAULTS.forward.verdicts;
+    out[k].ranges = r;
+  }
+  return out;
+}
+const rangeOf = (ranges, key) => {
+  const r = ranges && ranges[key];
+  if (Array.isArray(r)) return { min: isNum(r[0]) ? r[0] : null, max: isNum(r[1]) ? r[1] : null };
+  if (r && typeof r === 'object') return { min: isNum(r.min) ? r.min : null, max: isNum(r.max) ? r.max : null };
+  return { min: null, max: null };
+};
+const ymd = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+
+function closeAnyDialog() { document.querySelectorAll('dialog.dlg').forEach((d) => { try { d.close(); } catch {} d.remove(); }); }
+
+function confirmDialog(message, okLabel) {
+  closeAnyDialog();
+  return new Promise((resolve) => {
+    const dlg = document.createElement('dialog');
+    dlg.className = 'dlg small';
+    dlg.setAttribute('aria-labelledby', 'cf-msg');
+    dlg.innerHTML = `<div class="dlg-body"><p id="cf-msg" style="margin:0">${esc(message)}</p></div>
+      <div class="dlg-foot"><button type="button" data-no>Cancel</button><button type="button" class="danger" data-yes>${esc(okLabel || 'Delete')}</button></div>`;
+    document.body.appendChild(dlg);
+    let res = false;
+    dlg.querySelector('[data-yes]').onclick = () => { res = true; dlg.close(); };
+    dlg.querySelector('[data-no]').onclick = () => dlg.close();
+    dlg.addEventListener('close', () => { dlg.remove(); resolve(res); });
+    dlg.showModal();
+  });
+}
+
+async function openNewExperiment() {
+  closeAnyDialog();
+  const defs = await loadExpDefaults();
+  const B = defs.backtest.defaults, F = defs.forward.defaults;
+  const BR = defs.backtest.ranges, FR = defs.forward.ranges;
+  const today = new Date();
+  const endD = new Date(today); endD.setDate(endD.getDate() - 14);
+  const startD = new Date(endD); startD.setDate(startD.getDate() - 90);
+  const bStart = typeof B.start_date === 'string' ? B.start_date : ymd(startD);
+  const bEnd = typeof B.end_date === 'string' ? B.end_date : ymd(endD);
+  const val = (v) => (v === null || v === undefined ? '' : esc(v));
+  const rangeAttrs = (rs, key, fb) => { const r = rangeOf(rs, key); const mn = r.min ?? fb.min, mx = r.max ?? fb.max; return `${mn !== undefined && mn !== null ? ` min="${esc(mn)}"` : ''}${mx !== undefined && mx !== null ? ` max="${esc(mx)}"` : ''}`; };
+  const field = (id, label, input, help) => `<div class="field"><label for="${id}">${label}</label>${input}<div class="help" id="help-${id}">${help}</div><div class="ferr" id="err-${id}"></div></div>`;
+  const numIn = (id, v, attrs, step) => `<input type="number" id="${id}" name="${id}" value="${val(v)}" step="${step || 'any'}"${attrs || ''} inputmode="decimal" aria-describedby="help-${id} err-${id}">`;
+  const entrySel = (id, v) => `<select id="${id}" name="${id}" aria-describedby="help-${id}"><option value="next_open" ${v !== 'close' ? 'selected' : ''}>Next trading day's open (realistic)</option><option value="close" ${v === 'close' ? 'selected' : ''}>Close of the signal day</option></select>`;
+  const entryHelp = "When we pretend to buy. The next day's open is more realistic, because you can't buy at a close you only see after the fact.";
+  const scanOpts = state.scans.map((s) => `<option value="${esc(s.id)}">${esc(s.scan_date)} (${esc(s.candidates_count ?? '—')} candidates)</option>`).join('');
+  const fv = Array.isArray(F.verdicts) ? F.verdicts : [];
+
+  const dlg = document.createElement('dialog');
+  dlg.className = 'dlg';
+  dlg.setAttribute('aria-labelledby', 'dlg-title');
+  dlg.innerHTML = `<form id="exp-form" novalidate>
+    <div class="dlg-head"><h2 id="dlg-title">New experiment</h2><button type="button" class="x" data-close aria-label="Close">×</button></div>
+    <div class="dlg-body">
+      <fieldset class="kinds"><legend>What kind of experiment?</legend>
+        <label class="kind-opt"><input type="radio" name="kind" value="backtest" checked><span><b>History run</b><small>Replays the scanner over a past date range and measures what its picks did afterwards.</small></span></label>
+        <label class="kind-opt"><input type="radio" name="kind" value="forward"><span><b>Forward test</b><small>Freezes today's predictions, waits a few trading days, then marks each one right or wrong.</small></span></label>
+      </fieldset>
+      ${defs.fromServer ? '' : '<p class="note">Could not load the server defaults, so built-in ones are shown.</p>'}
+      <div class="field"><label for="exp-name">Name <span class="muted">(optional)</span></label><input type="text" id="exp-name" name="name" maxlength="80" placeholder="e.g. Spring penny-stock check"></div>
+      <div data-kind="backtest">
+        <div class="two">
+          ${field('bt_start_date', 'Start date', `<input type="date" id="bt_start_date" name="bt_start_date" value="${esc(bStart)}" aria-describedby="help-bt_start_date err-bt_start_date">`, 'First day the scanner is replayed on.')}
+          ${field('bt_end_date', 'End date', `<input type="date" id="bt_end_date" name="bt_end_date" value="${esc(bEnd)}" aria-describedby="help-bt_end_date err-bt_end_date">`, 'Last day. Leave room after it so picks can be followed.')}
+        </div>
+        <div class="two">
+          ${field('bt_horizon_days', 'Days to follow each pick', numIn('bt_horizon_days', B.horizon_days, rangeAttrs(BR, 'horizon_days', { min: 1 }), 1), 'Trading days after entry that we watch the price.')}
+          ${field('bt_hit_threshold_pct', 'Hit threshold (%)', numIn('bt_hit_threshold_pct', B.hit_threshold_pct, rangeAttrs(BR, 'hit_threshold_pct', { min: 0 })), 'Hit = price rose at least this much within the days above.')}
+        </div>
+        <div class="two">
+          ${field('bt_top_n', 'Picks per day', numIn('bt_top_n', B.top_n, rangeAttrs(BR, 'top_n', { min: 1 }), 1), 'Take the highest-scoring candidates each day, up to this many.')}
+          ${field('bt_min_score', 'Minimum score', numIn('bt_min_score', B.min_score, rangeAttrs(BR, 'min_score', { min: 0, max: 100 })), 'Ignore candidates scoring below this (0 to 100).')}
+        </div>
+        ${field('bt_entry', 'Entry price', entrySel('bt_entry', B.entry), entryHelp)}
+        <div class="field"><label class="check"><input type="checkbox" id="bt_include_filings" name="bt_include_filings" ${B.include_filings === false ? '' : 'checked'}> Use SEC filings when scoring</label><div class="help">More realistic, but the run takes longer.</div></div>
+      </div>
+      <div data-kind="forward" hidden>
+        <div class="field"><label for="fw_scan_id">Which predictions to freeze</label>
+          <select id="fw_scan_id" name="fw_scan_id" aria-describedby="help-fw_scan_id"><option value="">Latest scan</option>${scanOpts}</select>
+          <label class="check sub"><input type="checkbox" id="fw_run_fresh_scan" name="fw_run_fresh_scan" ${F.run_fresh_scan ? 'checked' : ''}> Run a fresh scan now instead (takes a few minutes)</label>
+          <div class="help" id="help-fw_scan_id">The picks are locked in today, so they cannot be tweaked after seeing the outcome.</div></div>
+        <fieldset class="field vchecks"><legend>Include these verdicts</legend>
+          ${['STRONG', 'WATCH', 'WEAK', 'AVOID'].map((v) => `<label class="check"><input type="checkbox" name="fw_verdicts" value="${v}" ${fv.includes(v) ? 'checked' : ''}> ${verdictBadge(v)}</label>`).join('')}
+          <div class="help">Only candidates with these verdicts are tracked.</div><div class="ferr" id="err-fw_verdicts"></div></fieldset>
+        <div class="two">
+          ${field('fw_horizon_days', 'Days to wait', numIn('fw_horizon_days', F.horizon_days, rangeAttrs(FR, 'horizon_days', { min: 1 }), 1), 'Trading days before each pick is marked right or wrong.')}
+          ${field('fw_hit_threshold_pct', 'Hit threshold (%)', numIn('fw_hit_threshold_pct', F.hit_threshold_pct, rangeAttrs(FR, 'hit_threshold_pct', { min: 0 })), 'Hit = price rose at least this much within the days above.')}
+        </div>
+        ${field('fw_min_score', 'Minimum score <span class="muted">(optional)</span>', numIn('fw_min_score', F.min_score, rangeAttrs(FR, 'min_score', { min: 0, max: 100 })), 'Ignore candidates scoring below this (0 to 100). Leave empty for no limit.')}
+        ${field('fw_entry', 'Entry price', entrySel('fw_entry', F.entry), entryHelp)}
+        <p class="note callout">Results become final after the due date, which is about <b id="fw-due-n">${esc(F.horizon_days)}</b> trading days from now. The app must be run again after then to score them; nothing is scored while it is closed.</p>
+      </div>
+      <div id="form-err" class="error" role="alert" hidden></div>
+    </div>
+    <div class="dlg-foot"><button type="button" data-close>Cancel</button><button type="submit" class="primary" id="exp-submit">Start experiment</button></div>
+  </form>`;
+  document.body.appendChild(dlg);
+  dlg.addEventListener('close', () => dlg.remove());
+  dlg.querySelectorAll('[data-close]').forEach((b) => { b.onclick = () => dlg.close(); });
+  const form = dlg.querySelector('#exp-form');
+  const kindOf = () => form.querySelector('input[name=kind]:checked').value;
+  const sync = () => {
+    const k = kindOf();
+    form.querySelectorAll('[data-kind]').forEach((d) => { d.hidden = d.dataset.kind !== k; });
+    form.querySelectorAll('.kind-opt').forEach((l) => l.classList.toggle('sel', l.querySelector('input').checked));
+    $('#exp-submit', form).textContent = k === 'forward' ? 'Freeze predictions' : 'Start experiment';
+    const fe = $('#form-err', form); fe.hidden = true;
+  };
+  form.querySelectorAll('input[name=kind]').forEach((r) => { r.onchange = sync; });
+  const fresh = $('#fw_run_fresh_scan', form), scanSel = $('#fw_scan_id', form);
+  const syncFresh = () => { scanSel.disabled = fresh.checked; };
+  fresh.onchange = syncFresh; syncFresh();
+  $('#fw_horizon_days', form).oninput = (e) => { $('#fw-due-n', form).textContent = e.target.value || '—'; };
+  sync();
+
+  const collect = () => {
+    const kind = kindOf(), pre = kind === 'backtest' ? 'bt' : 'fw';
+    const R = kind === 'backtest' ? BR : FR;
+    const errs = {}, p = {};
+    const g = (n) => form.querySelector(`[name="${pre}_${n}"]`);
+    const num = (n, label, o = {}) => {
+      const raw = g(n).value.trim();
+      if (raw === '') { if (o.optional) return null; errs[`${pre}_${n}`] = `${label} is required.`; return null; }
+      const v = Number(raw);
+      if (!Number.isFinite(v)) { errs[`${pre}_${n}`] = `${label} must be a number.`; return null; }
+      if (o.int && !Number.isInteger(v)) { errs[`${pre}_${n}`] = `${label} must be a whole number.`; return null; }
+      const r = rangeOf(R, n);
+      const mn = r.min ?? o.min, mx = r.max ?? o.max;
+      if (o.gt0 && v <= 0) { errs[`${pre}_${n}`] = `${label} must be greater than 0.`; return null; }
+      if (mn !== undefined && mn !== null && v < mn) { errs[`${pre}_${n}`] = `${label} must be at least ${mn}.`; return null; }
+      if (mx !== undefined && mx !== null && v > mx) { errs[`${pre}_${n}`] = `${label} must be at most ${mx}.`; return null; }
+      return v;
+    };
+    if (kind === 'backtest') {
+      const s = g('start_date').value, e = g('end_date').value;
+      if (!s) errs.bt_start_date = 'Start date is required.';
+      if (!e) errs.bt_end_date = 'End date is required.';
+      if (s && e && s > e) errs.bt_end_date = 'End date must be on or after the start date.';
+      p.start_date = s; p.end_date = e;
+      p.horizon_days = num('horizon_days', 'Days to follow', { int: true, min: 1 });
+      p.hit_threshold_pct = num('hit_threshold_pct', 'Hit threshold', { gt0: true });
+      p.top_n = num('top_n', 'Picks per day', { int: true, min: 1 });
+      p.min_score = num('min_score', 'Minimum score', { min: 0, max: 100 });
+      p.entry = g('entry').value;
+      p.include_filings = g('include_filings').checked;
+    } else {
+      p.run_fresh_scan = g('run_fresh_scan').checked;
+      if (!p.run_fresh_scan && g('scan_id').value) p.scan_id = isNaN(Number(g('scan_id').value)) ? g('scan_id').value : Number(g('scan_id').value);
+      p.verdicts = [...form.querySelectorAll('input[name=fw_verdicts]:checked')].map((c) => c.value);
+      if (!p.verdicts.length) errs.fw_verdicts = 'Pick at least one verdict.';
+      p.horizon_days = num('horizon_days', 'Days to wait', { int: true, min: 1 });
+      p.hit_threshold_pct = num('hit_threshold_pct', 'Hit threshold', { gt0: true });
+      const ms = num('min_score', 'Minimum score', { min: 0, max: 100, optional: true });
+      if (ms !== null) p.min_score = ms;
+      p.entry = g('entry').value;
+    }
+    return { kind, p, errs, pre };
+  };
+
+  form.onsubmit = async (ev) => {
+    ev.preventDefault();
+    const { kind, p, errs } = collect();
+    form.querySelectorAll('.ferr').forEach((x) => { x.textContent = ''; });
+    form.querySelectorAll('[aria-invalid]').forEach((x) => x.removeAttribute('aria-invalid'));
+    const fe = $('#form-err', form); fe.hidden = true;
+    const keys = Object.keys(errs);
+    if (keys.length) {
+      keys.forEach((k) => { const el = $('#err-' + k, form); if (el) el.textContent = errs[k]; const inp = form.querySelector(`[name="${k}"]`); if (inp) inp.setAttribute('aria-invalid', 'true'); });
+      const first = form.querySelector(`[name="${keys[0]}"]`) || form.querySelector(`input[name="${keys[0]}"]`);
+      if (first && first.focus) first.focus();
+      fe.textContent = 'Please fix the highlighted fields.'; fe.hidden = false;
+      return;
+    }
+    const body = { kind, params: p };
+    const nm = $('#exp-name', form).value.trim();
+    if (nm) body.name = nm;
+    const btn = $('#exp-submit', form);
+    const label = btn.textContent;
+    btn.disabled = true; btn.textContent = 'Starting…';
+    try {
+      const r = await api('/api/experiments', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      dlg.close();
+      if (r && r.id !== undefined && r.id !== null) location.hash = expHref(r.id); else render();
+    } catch (e) {
+      fe.textContent = e.status === 409
+        ? `Another experiment or scan is already running. Wait for it to finish, then try again.${e.detail ? ' (' + detailText(e) + ')' : ''}`
+        : e.status === 400 ? `The server rejected these settings: ${detailText(e)}` : `Could not start the experiment: ${e.message}`;
+      fe.hidden = false; fe.scrollIntoView({ block: 'nearest' });
+      btn.disabled = false; btn.textContent = label;
+    }
+  };
+  dlg.showModal();
+}
+
+/* ---- detail ---- */
+const CMP_ROWS = [
+  ['hit_rate', 'Hit rate', 'Share of picks that reached the hit threshold', false],
+  ['avg_return', 'Average return', 'Mean return at the end of the follow period', true],
+  ['median_return', 'Median return', 'The typical pick, ignoring huge winners', true],
+  ['win_rate', 'Win rate', 'Share of picks that ended above entry', false],
+  ['avg_max_gain', 'Avg max gain', 'Best point reached, on average', true],
+  ['avg_max_drawdown', 'Avg max drawdown', 'Worst dip below entry, on average', true],
+];
+const cellVal = (v, signed) => (signed ? pctCell(v) : fmt.pctPlain(v));
+const diffCell = (a, b) => {
+  if (!isNum(a) || !isNum(b)) return '<span class="muted">—</span>';
+  const x = (a - b) * 100;
+  return `<span class="${signCls(Math.abs(x) < 0.05 ? 0 : x)}">${x > 0.05 ? '+' : ''}${x.toFixed(1)} pp</span>`;
+};
+
+function groupTable(rows, headLabel, labelFn, baseline) {
+  const cols = ['evaluated', 'hit_rate', 'avg_return', 'median_return', 'win_rate', 'avg_max_gain', 'avg_max_drawdown'];
+  const tr = (g, label, cls) => `<tr class="${cls || ''}"><td>${label}</td><td class="num">${fmt.int(g.count)}</td><td class="num">${fmt.int(g.evaluated)}</td>
+    <td class="num">${fmt.pctPlain(g.hit_rate)}</td><td class="num">${pctCell(g.avg_return)}</td><td class="num">${pctCell(g.median_return)}</td>
+    <td class="num">${fmt.pctPlain(g.win_rate)}</td><td class="num">${pctCell(g.avg_max_gain)}</td><td class="num">${pctCell(g.avg_max_drawdown)}</td></tr>`;
+  void cols;
+  return `<div class="table-wrap"><table><thead><tr><th>${esc(headLabel)}</th><th class="num">Picks</th><th class="num">Scored</th><th class="num">Hit rate</th><th class="num">Avg return</th><th class="num">Median</th><th class="num">Win rate</th><th class="num">Avg max gain</th><th class="num">Avg max DD</th></tr></thead>
+    <tbody>${rows.map((g) => tr(g, labelFn(g))).join('')}${baseline ? tr(baseline, '<i>All penny stocks (baseline)</i>', 'base-row') : ''}</tbody></table></div>`;
+}
+
+function drawEquityChart(curve) {
+  const el = $('#eq-chart');
+  if (!el) return;
+  const series = (k) => {
+    const m = new Map();
+    for (const r of curve) if (r && r.date && isNum(r[k])) m.set(r.date, r[k]);
+    return [...m.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1)).map(([time, value]) => ({ time, value }));
+  };
+  const sp = series('cumulative_picks'), sb = series('cumulative_baseline');
+  if (sp.length < 2 && sb.length < 2) { $('#eq-panel').hidden = true; return; }
+  if (!window.LightweightCharts) { el.innerHTML = '<p class="muted">Chart library failed to load (needs network access to unpkg.com).</p>'; return; }
+  const LW = window.LightweightCharts;
+  const cp = cssVar('--s-picks'), cb = cssVar('--s-base');
+  const pf = { type: 'custom', minMove: 0.0001, formatter: (v) => (v > 0 ? '+' : '') + (v * 100).toFixed(1) + '%' };
+  chartInst = LW.createChart(el, {
+    width: el.clientWidth, height: 300,
+    layout: { background: { color: 'transparent' }, textColor: cssVar('--chart-text') },
+    grid: { vertLines: { color: cssVar('--chart-grid') }, horzLines: { color: cssVar('--chart-grid') } },
+    rightPriceScale: { borderColor: cssVar('--border') },
+    timeScale: { borderColor: cssVar('--border') },
+    crosshair: { mode: 0 },
+  });
+  const lp = chartInst.addLineSeries({ color: cp, lineWidth: 3, priceFormat: pf, title: '' });
+  const lb = chartInst.addLineSeries({ color: cb, lineWidth: 2, lineStyle: 2, priceFormat: pf, title: '' });
+  lp.setData(sp); lb.setData(sb);
+  chartInst.timeScale().fitContent();
+  const vp = $('#lg-picks'), vb = $('#lg-base');
+  chartInst.subscribeCrosshairMove((param) => {
+    const a = param && param.seriesData && param.seriesData.get(lp), b = param && param.seriesData && param.seriesData.get(lb);
+    vp.textContent = a && isNum(a.value) ? fmt.pct(a.value) : '';
+    vb.textContent = b && isNum(b.value) ? fmt.pct(b.value) : '';
+  });
+  chartRO = new ResizeObserver(() => chartInst && chartInst.applyOptions({ width: el.clientWidth }));
+  chartRO.observe(el);
+}
+
+const resultOf = (p) => (p.hit === true ? 'Hit' : p.hit === false ? 'Miss' : 'Pending');
+const PICK_COLS = [
+  { key: 'signal_date', label: 'Signal date', text: true, get: (p) => p.signal_date },
+  { key: 'ticker', label: 'Ticker', text: true, get: (p) => p.ticker },
+  { key: 'verdict', label: 'Verdict', get: (p) => ({ STRONG: 4, WATCH: 3, WEAK: 2, AVOID: 1 }[p.verdict] ?? 0) },
+  { key: 'score', label: 'Score', num: true, get: (p) => p.score },
+  { key: 'entry_date', label: 'Entry', text: true, get: (p) => p.entry_date },
+  { key: 'entry_price', label: 'Entry $', num: true, get: (p) => p.entry_price },
+  { key: 'exit_date', label: 'Exit', text: true, get: (p) => p.exit_date },
+  { key: 'exit_price', label: 'Exit $', num: true, get: (p) => p.exit_price },
+  { key: 'return', label: 'Return', num: true, get: (p) => p.return },
+  { key: 'max_gain', label: 'Max gain', num: true, get: (p) => p.max_gain },
+  { key: 'max_drawdown', label: 'Max DD', num: true, get: (p) => p.max_drawdown },
+  { key: 'result', label: 'Result', get: (p) => ({ Hit: 2, Miss: 1, Pending: 0 }[resultOf(p)]) },
+  { key: 'flags', label: 'Risk flags', get: (p) => (Array.isArray(p.risk_flags) ? p.risk_flags.length : 0) },
+];
+const PAGE_SIZE = 50;
+
+function pickRow(p) {
+  const r = resultOf(p), partial = p.status === 'partial';
+  const flags = Array.isArray(p.risk_flags) ? p.risk_flags : [];
+  return `<tr class="${partial ? 'partial' : ''}"><td>${fmt.date(p.signal_date)}</td>
+    <td><a href="#/t/${encodeURIComponent(p.ticker || '')}"><b>${esc(p.ticker) || '—'}</b></a><div class="tk-name" title="${esc(p.name)}">${esc(p.name) || ''}</div></td>
+    <td>${verdictBadge(p.verdict)}</td><td class="num">${fmt.int(p.score)}</td>
+    <td>${fmt.date(p.entry_date)}</td><td class="num">${fmt.price(p.entry_price)}</td>
+    <td>${fmt.date(p.exit_date)}</td><td class="num">${fmt.price(p.exit_price)}</td>
+    <td class="num">${pctCell(p.return)}</td><td class="num">${pctCell(p.max_gain)}</td><td class="num">${pctCell(p.max_drawdown)}</td>
+    <td><span class="res res-${r}">${r}</span>${partial ? ' <span class="chip low" title="Still within its follow period; the numbers may change">In progress</span>' : ''}</td>
+    <td><div class="chips">${flags.slice(0, 2).map((f) => `<span class="chip low" title="${esc(f)}">${esc(String(f).length > 22 ? String(f).slice(0, 21) + '…' : f)}</span>`).join('')}${flags.length > 2 ? `<span class="chip low" title="${esc(flags.slice(2).join('; '))}">+${flags.length - 2}</span>` : ''}${flags.length ? '' : '<span class="muted">—</span>'}</div></td></tr>`;
+}
+
+function picksSection(d) {
+  const picks = Array.isArray(d.picks) ? d.picks : [];
+  if (!state.pk || state.pk.id !== d.id) state.pk = { id: d.id, sort: { key: 'signal_date', dir: -1 }, verdict: '', result: '', q: '', page: 0 };
+  const pk = state.pk;
+  const verdicts = [...new Set(picks.map((p) => p.verdict).filter(Boolean))];
+  const total = isNum(d.picks_total) ? d.picks_total : picks.length;
+  $('#picks-body').innerHTML = `
+    <div class="toolbar">
+      <label>Verdict <select id="pf-verdict"><option value="">All</option>${verdicts.map((v) => `<option ${pk.verdict === v ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select></label>
+      <label>Result <select id="pf-result">${['', 'Hit', 'Miss', 'Pending'].map((v) => `<option value="${v}" ${pk.result === v ? 'selected' : ''}>${v || 'All'}</option>`).join('')}</select></label>
+      <label>Ticker <input id="pf-q" type="search" placeholder="Search" value="${esc(pk.q)}" style="width:110px"></label>
+      <span class="count" id="pf-count"></span>
+    </div>
+    ${total > picks.length ? `<p class="note">Showing the first ${fmt.int(picks.length)} of ${fmt.int(total)} picks.</p>` : ''}
+    <div class="table-wrap"><table id="ptable"><thead><tr>${headerCells(PICK_COLS, pk.sort)}</tr></thead><tbody id="prows"></tbody></table></div>
+    <div class="pager"><button id="pg-prev">‹ Prev</button><span id="pg-info" class="muted"></span><button id="pg-next">Next ›</button></div>`;
+  const draw = () => {
+    const q = pk.q.trim().toLowerCase();
+    let rows = picks.filter((p) => (!pk.verdict || p.verdict === pk.verdict) && (!pk.result || resultOf(p) === pk.result) && (!q || String(p.ticker || '').toLowerCase().includes(q) || String(p.name || '').toLowerCase().includes(q)));
+    rows = sortRows(rows, PICK_COLS, pk.sort);
+    const pages = Math.max(1, Math.ceil(rows.length / PAGE_SIZE));
+    pk.page = Math.min(pk.page, pages - 1);
+    const from = pk.page * PAGE_SIZE;
+    $('#pf-count').textContent = `${fmt.int(rows.length)} of ${fmt.int(picks.length)} picks`;
+    $('#prows').innerHTML = rows.length ? rows.slice(from, from + PAGE_SIZE).map(pickRow).join('') : `<tr><td colspan="${PICK_COLS.length}" class="empty">${picks.length ? 'No picks match these filters.' : 'No picks recorded.'}</td></tr>`;
+    $('#pg-info').textContent = rows.length ? `${from + 1}–${Math.min(rows.length, from + PAGE_SIZE)} of ${fmt.int(rows.length)} · page ${pk.page + 1} of ${pages}` : '';
+    $('#pg-prev').disabled = pk.page <= 0; $('#pg-next').disabled = pk.page >= pages - 1;
+  };
+  draw();
+  $('#pf-verdict').onchange = (e) => { pk.verdict = e.target.value; pk.page = 0; draw(); };
+  $('#pf-result').onchange = (e) => { pk.result = e.target.value; pk.page = 0; draw(); };
+  $('#pf-q').oninput = (e) => { pk.q = e.target.value; pk.page = 0; draw(); };
+  $('#pg-prev').onclick = () => { pk.page--; draw(); };
+  $('#pg-next').onclick = () => { pk.page++; draw(); };
+  $('#ptable thead').onclick = (e) => {
+    const th = e.target.closest('th[data-sort]'); if (!th) return;
+    const k = th.dataset.sort;
+    pk.sort = { key: k, dir: pk.sort.key === k ? -pk.sort.dir : (PICK_COLS.find((c) => c.key === k).text ? 1 : -1) };
+    pk.page = 0;
+    $('#ptable thead tr').innerHTML = headerCells(PICK_COLS, pk.sort); draw();
+  };
+}
+
+function drawExperiment(d, token) {
+  stopExpTimer();
+  destroyChart();
+  const s = d.summary || {};
+  const h = d.headline || null;
+  const fallbackO = h ? { hit_rate: h.hit_rate, avg_return: h.avg_return, evaluated: h.evaluated, count: h.picks } : {};
+  const fallbackB = h ? { hit_rate: h.baseline_hit_rate, avg_return: h.baseline_avg_return } : {};
+  const o = s.overall || fallbackO, b = s.baseline || fallbackB;
+  const hl = { evaluated: isNum(o.evaluated) ? o.evaluated : h && h.evaluated, hit_rate: o.hit_rate, baseline_hit_rate: b.hit_rate, avg_return: o.avg_return, baseline_avg_return: b.avg_return };
+  const v = expVerdict(hl, d.status);
+  const done = d.status === 'completed' || d.status === 'waiting';
+  const byV = Array.isArray(s.by_verdict) ? [...s.by_verdict] : [];
+  const order = ['STRONG', 'WATCH', 'WEAK', 'AVOID'];
+  byV.sort((x, y) => (order.indexOf(x.verdict) + 1 || 9) - (order.indexOf(y.verdict) + 1 || 9));
+  const byM = Array.isArray(s.by_month) ? [...s.by_month].sort((x, y) => String(x.month).localeCompare(String(y.month))) : [];
+  const curve = Array.isArray(s.equity_curve) ? s.equity_curve : [];
+  const notes = Array.isArray(d.notes) ? d.notes.filter(Boolean) : [];
+  const picks = Array.isArray(d.picks) ? d.picks : [];
+  const hasSummary = !!(s.overall || h);
+
+  let status = '';
+  if (d.status === 'running') status = `<div class="panel"><h2>In progress</h2>${progressBar(d.progress)}<p class="muted" style="margin:8px 0 0">${esc(d.message) || 'Working…'}${isNum(d.progress) ? ` (${Math.round(d.progress * 100)}%)` : ''} This page updates by itself.</p></div>`;
+  else if (d.status === 'failed') status = `<div class="error"><b>This experiment failed.</b><div>${esc(d.error || d.message) || 'No error message was recorded.'}</div></div>`;
+  else if (d.status === 'waiting') status = `<div class="panel callout"><b>Waiting for results.</b> The predictions are frozen. They will be scored after <b>${fmt.date(d.due_date)}</b>; the app must be running then. Rows marked "In progress" show the price so far. ${d.message ? esc(d.message) : ''}</div>`;
+
+  const noNumbers = d.status === 'waiting' && !(isNum(o.evaluated) && o.evaluated > 0);
+  const cmp = hasSummary && !noNumbers && d.status !== 'running' && d.status !== 'failed' ? `
+    <div class="panel cmp-panel"><h2>Picks vs baseline</h2>
+      <div class="cmp-top">
+        <div class="cmp-verdict">${v ? `<div class="vd vd-${v.cls} lg"><span aria-hidden="true">${v.icon}</span> ${esc(v.label)}</div><div class="muted">${esc(v.why)}</div>` : `<div class="vd vd-few lg">${d.status === 'waiting' ? 'Not scored yet' : 'No verdict'}</div><div class="muted">${d.status === 'waiting' ? 'Check back after the due date.' : ''}</div>`}</div>
+        <div class="cmp-big"><span class="muted">Hit rate</span><div><b>${fmt.pctPlain(o.hit_rate, 1)}</b> <small>picks</small></div><div class="base"><b>${fmt.pctPlain(b.hit_rate, 1)}</b> <small>baseline</small></div></div>
+        <div class="cmp-big"><span class="muted">Average return</span><div><b>${pctCell(o.avg_return)}</b> <small>picks</small></div><div class="base"><b>${pctCell(b.avg_return)}</b> <small>baseline</small></div></div>
+      </div>
+      <p class="note" style="margin-top:12px">Baseline = all penny stocks on the same days. ${fmt.int(o.evaluated)} of ${fmt.int(o.count)} picks scored. "pp" = percentage points.</p>
+      <div class="table-wrap"><table class="cmp"><thead><tr><th>Measure</th><th class="num">Picks</th><th class="num">Baseline</th><th class="num">Difference</th></tr></thead><tbody>
+        ${CMP_ROWS.map(([k, label, help, signed]) => `<tr><td><b>${label}</b><div class="li-meta">${help}</div></td><td class="num">${cellVal(o[k], signed)}</td><td class="num">${cellVal(b[k], signed)}</td><td class="num">${diffCell(o[k], b[k])}</td></tr>`).join('')}
+      </tbody></table></div></div>` : '';
+
+  app.innerHTML = `
+    <a class="back" href="#/experiments">← All experiments</a>
+    <div class="headline">
+      <div><h1>${esc(expName(d))}</h1><div class="sub">${esc(kindLabel(d.kind))} · Created ${fmt.dt(d.created_at)}${d.finished_at ? ` · Finished ${fmt.dt(d.finished_at)}` : ''}${d.status === 'waiting' ? ` · Due ${fmt.date(d.due_date)}` : ''}</div></div>
+      ${statusBadge(d.status)}${verdictChip(v)}
+      <div class="exp-actions">
+        ${d.status === 'waiting' && d.kind === 'forward' ? '<button class="primary" id="x-check">Check results now</button>' : ''}
+        <button class="danger-o" id="x-del" ${d.status === 'running' ? 'disabled title="Cannot delete while running"' : ''}>Delete</button>
+      </div>
+    </div>
+    <div id="x-err" class="error" role="alert" hidden></div>
+    <p class="exp-params">${describeParams(d.kind, d.params)}</p>
+    ${status}
+    ${cmp}
+    ${done && byV.length ? `<div class="panel"><h2>By verdict</h2><p class="note">Does STRONG do better than WATCH?</p>${groupTable(byV, 'Verdict', (g) => verdictBadge(g.verdict), s.baseline)}</div>` : ''}
+    ${done && curve.length ? `<div class="panel" id="eq-panel"><h2>Cumulative return: picks vs baseline</h2>
+      <div class="legend" id="eq-legend"><span><i class="sw sw-picks"></i>Picks <b id="lg-picks"></b></span><span><i class="sw sw-base"></i>Baseline (all penny stocks) <b id="lg-base"></b></span></div>
+      <div id="eq-chart"></div></div>` : ''}
+    ${done && byM.length ? `<div class="panel"><h2>By month</h2>${groupTable(byM, 'Month', (g) => esc(g.month) || '—', null)}</div>` : ''}
+    ${notes.length ? `<div class="notes"><h3>Things to keep in mind</h3><ul>${notes.map((n) => `<li>${esc(n)}</li>`).join('')}</ul></div>` : ''}
+    ${picks.length || isNum(d.picks_total) ? `<div class="panel"><h2>Picks (${fmt.int(isNum(d.picks_total) ? d.picks_total : picks.length)})</h2><div id="picks-body"></div></div>` : ''}`;
+
+  if (curve.length) drawEquityChart(curve);
+  if ($('#picks-body')) picksSection(d);
+  const err = (m) => { const el = $('#x-err'); el.textContent = m; el.hidden = false; el.scrollIntoView({ block: 'nearest' }); };
+  const chk = $('#x-check');
+  if (chk) chk.onclick = async () => {
+    chk.disabled = true; chk.textContent = 'Checking…';
+    try { const nd = await api(`/api/experiments/${encodeURIComponent(d.id)}/evaluate`, { method: 'POST' }); if (token === renderToken) drawExperiment(nd, token); }
+    catch (e) { if (token !== renderToken) return; chk.disabled = false; chk.textContent = 'Check results now'; err(`Could not check results: ${detailText(e)}`); }
+  };
+  $('#x-del').onclick = async () => {
+    if (!(await confirmDialog(`Delete "${expName(d)}"? This removes the experiment and all of its picks.`, 'Delete'))) return;
+    try { await api(`/api/experiments/${encodeURIComponent(d.id)}`, { method: 'DELETE' }); location.hash = '#/experiments'; }
+    catch (e) { err(e.status === 409 ? 'This experiment is still running and cannot be deleted yet.' : `Could not delete: ${detailText(e)}`); }
+  };
+  if (d.status === 'running') {
+    state.expTimer = setTimeout(async () => {
+      if (token !== renderToken) return;
+      try { const nd = await api(`/api/experiments/${encodeURIComponent(d.id)}`); if (token === renderToken) drawExperiment(nd, token); }
+      catch { if (token === renderToken) state.expTimer = setTimeout(() => drawExperiment(d, token), 5000); }
+    }, 2000);
+  }
+}
+
+async function viewExperiment(id, token) {
+  app.innerHTML = '<p class="muted">Loading…</p>';
+  let d;
+  try { d = await api(`/api/experiments/${encodeURIComponent(id)}`); }
+  catch (e) {
+    if (token !== renderToken) return;
+    app.innerHTML = `<a class="back" href="#/experiments">← All experiments</a><div class="error">${e.status === 404 ? 'That experiment does not exist (it may have been deleted).' : 'Failed to load: ' + esc(e.message)}</div>`;
+    return;
+  }
+  if (token !== renderToken) return;
+  drawExperiment(d, token);
 }
 
 /* ---------- boot ---------- */
