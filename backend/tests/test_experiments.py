@@ -449,8 +449,9 @@ def _wait(client, exp_id, timeout=10):
     t0 = time.time()
     while time.time() - t0 < timeout:
         r = client.get(f"/api/experiments/{exp_id}").json()
-        if r["status"] != "running":
-            return r
+        # The status flips before the worker thread writes its last fields, so wait for the thread too.
+        if r["status"] != "running" and not experiments.RUNNER.running:
+            return client.get(f"/api/experiments/{exp_id}").json()
         time.sleep(0.05)
     raise AssertionError("experiment did not finish")
 
