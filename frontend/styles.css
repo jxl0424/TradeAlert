@@ -236,3 +236,9 @@ label.check.sub{margin-top:6px}
 .vchecks>.help,.vchecks>.ferr{width:100%}
 [hidden]{display:none!important}
 .kinds{margin-top:6px!important}
+
+a.btn{display:inline-block;padding:6px 12px;border:1px solid var(--border);border-radius:6px;text-decoration:none;color:inherit;font-size:14px}
+a.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
+a.btn.primary:hover{filter:brightness(1.1)}
+a.btn.big{padding:9px 20px;font-size:15px}
+.static-note a.btn{padding:2px 8px;font-size:13px;margin-left:2px}

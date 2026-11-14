@@ -141,6 +141,7 @@ python run.py experiment forward                                   # from the la
 python run.py experiment forward --fresh-scan --verdicts STRONG,WATCH
 python run.py experiment evaluate                                  # settle waiting forward tests
 python run.py experiment list
+python run.py export-site --out _site                              # static, view-only copy of the dashboard
 ```
 
 ### Reading the results
@@ -217,6 +218,59 @@ the full universe takes a few minutes, mostly spent downloading prices (see belo
 
 The dashboard server does not need to be running for scheduled scans. Start it when you
 want to look at the results.
+
+## Free hosting on GitHub
+
+TradeAlert can run entirely on GitHub for free: GitHub Actions does the daily scan and the
+experiments, and GitHub Pages serves a **view-only** copy of the dashboard. Nothing runs on your PC.
+
+How it works: the workflows in `.github/workflows/` keep the SQLite database on an orphan branch
+called `data` (a single file, force-pushed as one commit each time, so the branch never grows; the
+default branch is never touched). After every run `python run.py export-site --out _site` snapshots
+every API response as static JSON next to the dashboard files and Pages publishes that folder.
+The static dashboard has no Run scan, New experiment or Delete buttons; it shows "Start on GitHub"
+links to the workflows instead.
+
+### One-time setup (repository owner)
+
+1. **Enable Pages**: Settings, Pages, Build and deployment, Source: **GitHub Actions**.
+2. **Workflow permissions** (only if runs fail with a 403 when pushing the `data` branch): Settings,
+   Actions, General, Workflow permissions, **Read and write permissions**. Also make sure Actions
+   are enabled for the repository.
+3. **Optional secrets and variable** (Settings, Secrets and variables, Actions). The workflows succeed
+   without any of them.
+   - Variable `SEC_USER_AGENT` (tab "Variables"), for example `TradeAlert research tool you@example.com`.
+     SEC asks for a contact email; a generic fallback is used if you set nothing. A secret with the same
+     name also works.
+   - Secret `ANTHROPIC_API_KEY`: AI summaries for the top candidates (small paid usage).
+   - Secret `FINNHUB_API_KEY`: extra company news.
+4. **Run the first scan manually**: Actions tab, **Daily scan**, Run workflow. The first run
+   creates the `data` branch and deploys the site; a full scan takes several minutes. After that it runs
+   by itself on weekdays at 22:17 UTC (after the US close in both winter and summer time).
+5. **Dashboard URL**: `https://<your-user>.github.io/<repo-name>/` (also shown on the deploy job and
+   under Settings, Pages).
+
+### Start an experiment
+
+Actions tab, **Experiment**, Run workflow. Pick `backtest` or `forward` and fill in any of the optional
+fields (blank means the CLI default; `start_date`, `end_date` and `top_n` apply to backtests only). A
+backtest downloads about two years of prices and takes roughly 10 to 15 minutes. When it finishes the
+site is redeployed with the new experiment. Forward experiments are settled by the daily scan once their
+window has passed.
+
+### Caveats
+
+- **Everything is public** when the repository is public: the dashboard, the picks and the `data`
+  branch database. Do not rely on this for anything private. Use a private repository (Pages from private
+  repositories needs a paid plan) if that matters.
+- Scheduled runs can start late or be skipped under GitHub load, and GitHub disables scheduled workflows
+  after 60 days without repository activity (re-enable them in the Actions tab, or run one manually).
+- Yahoo Finance may throttle GitHub's shared servers. The scan retries once after 10 minutes; if both
+  fail, the run is marked failed and the previous data stays online.
+- Only one workflow writes the database at a time (they queue), and GitHub keeps at most one waiting
+  run per queue, so triggering many runs at once can drop the middle ones.
+- The static site keeps candidate pages for the 30 most recent scans.
+- Scheduled workflows run only from the default branch, so the `.github/workflows` files must be merged there.
 
 ## Data sources and limits
 

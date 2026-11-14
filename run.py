@@ -6,6 +6,7 @@
     python run.py experiment forward [--scan-id N | --fresh-scan] [--verdicts STRONG,WATCH ...]
     python run.py experiment evaluate [--id N]    # settle waiting forward experiments now
     python run.py experiment list | show N
+    python run.py export-site --out DIR           # static view-only site (GitHub Pages)
 """
 from __future__ import annotations
 
@@ -17,7 +18,7 @@ sys.path.insert(0, str(BACKEND))
 
 
 def main() -> int:
-    if len(sys.argv) < 2 or sys.argv[1] not in ("scan", "serve", "experiment"):
+    if len(sys.argv) < 2 or sys.argv[1] not in ("scan", "serve", "experiment", "export-site"):
         print(__doc__)
         return 2
     cmd, rest = sys.argv[1], sys.argv[2:]
@@ -25,6 +26,10 @@ def main() -> int:
         from tradealert.experiments import main as experiment_main
 
         return experiment_main(rest)
+    if cmd == "export-site":
+        from tradealert.export_site import main as export_main
+
+        return export_main(rest)
     if cmd == "scan":
         from tradealert.scan import main as scan_main
 

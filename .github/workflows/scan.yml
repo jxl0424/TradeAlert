@@ -1,0 +1,96 @@
+name: Daily scan
+
+# 22:17 UTC is 17:17 US Eastern in winter (EST) and 18:17 in summer (EDT), both after the
+# 16:30 ET point where the scan treats the session as settled. GitHub may delay scheduled runs.
+on:
+  schedule:
+    - cron: "17 22 * * 1-5"
+  workflow_dispatch:
+
+# One group for every workflow that writes the database, so writers never overlap.
+concurrency:
+  group: tradealert-data
+  cancel-in-progress: false
+
+permissions: {}
+
+env:
+  PYTHONUNBUFFERED: "1"
+  SEC_USER_AGENT: ${{ vars.SEC_USER_AGENT || secrets.SEC_USER_AGENT || 'TradeAlert research tool tradealert-noreply@users.noreply.github.com' }}
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: write   # only to force-push the `data` branch
+    outputs:
+      exported: ${{ steps.export.outputs.exported }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Restore database from the data branch
+        run: .github/scripts/restore-db.sh
+      - name: Restore price cache
+        uses: actions/cache@v4
+        with:
+          path: data/cache
+          key: tradealert-cache-${{ github.run_id }}
+          restore-keys: tradealert-cache-
+      - name: Scan (retries once if it fails, e.g. Yahoo throttling)
+        id: scan
+        continue-on-error: true
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+        run: |
+          if ! python run.py scan; then
+            echo "::warning::Scan failed, retrying once in 10 minutes."
+            sleep 600
+            python run.py scan
+          fi
+      - name: Save database to the data branch
+        if: ${{ always() }}
+        run: .github/scripts/save-db.sh
+      - name: Export static site
+        id: export
+        if: ${{ always() }}
+        run: |
+          python run.py export-site --out _site
+          echo "exported=true" >> "$GITHUB_OUTPUT"
+      - name: Upload site artifact
+        if: ${{ always() && steps.export.outputs.exported == 'true' }}
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - name: Fail the run if the scan failed
+        if: ${{ steps.scan.outcome == 'failure' }}
+        run: |
+          echo "::error::The scan failed twice. The database and site were still saved."
+          exit 1
+
+  deploy:
+    needs: scan
+    if: ${{ always() && needs.scan.outputs.exported == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        continue-on-error: true
+        uses: actions/deploy-pages@v4
+      - name: Explain a failed deploy
+        if: ${{ steps.deployment.outcome == 'failure' }}
+        run: |
+          echo "::error::Pages deploy failed. Enable Pages first: repository Settings > Pages > Build and deployment > Source: GitHub Actions. The database was already saved; re-run this workflow afterwards."
+          exit 1

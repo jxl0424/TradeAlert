@@ -40,7 +40,62 @@ const fmt = {
 const signCls = (n) => (!isNum(n) || n === 0 ? '' : n > 0 ? 'up' : 'down');
 const pctCell = (n, d) => `<span class="${signCls(n)}">${fmt.pct(n, d)}</span>`;
 
+/* ---------- static (GitHub Pages) mode ----------
+   site-config.js (written by `run.py export-site`) sets window.TRADEALERT_STATIC. In live mode the
+   server serves an empty one, so STATIC is null and everything below behaves exactly as before.
+   All URLs are relative so the page works from a sub-path such as /TradeAlert/. */
+const STATIC = (typeof window.TRADEALERT_STATIC === 'object' && window.TRADEALERT_STATIC) || null;
+// Must match safe_name() in backend/tradealert/export_site.py.
+const safeName = (t) => {
+  const bytes = new TextEncoder().encode(String(t).toUpperCase());
+  let out = '';
+  bytes.forEach((b, i) => {
+    const ch = String.fromCharCode(b);
+    out += b < 128 && /[A-Z0-9.\-]/.test(ch) && !(i === 0 && ch === '.') ? ch : '_' + b.toString(16).padStart(2, '0');
+  });
+  return out || '_';
+};
+const ghRepo = STATIC && /^[\w.-]+\/[\w.-]+$/.test(STATIC.repo || '') ? STATIC.repo : '';
+const ghUrl = (workflow) => (ghRepo ? `https://github.com/${ghRepo}/actions${workflow ? '/workflows/' + workflow : ''}` : '');
+const ghLink = (label, workflow, cls = '') => {
+  const u = ghUrl(workflow);
+  return u ? `<a class="btn ${cls}" href="${esc(u)}" target="_blank" rel="noopener noreferrer">${esc(label)}</a>` : '';
+};
+
+async function staticGet(path) {
+  const u = new URL(path, 'http://x');
+  const seg = u.pathname.replace(/^\/api\//, '').split('/').map(decodeURIComponent);
+  const q = u.searchParams;
+  const file = async (rel) => {
+    const r = await fetch(rel);
+    if (!r.ok) { const e = new Error(`${r.status} ${r.statusText}`); e.status = r.status; throw e; }
+    return r.json();
+  };
+  if (seg[0] === 'candidates' && seg.length === 1) {
+    const d = await file(q.get('scan_id') ? `api/candidates/${encodeURIComponent(q.get('scan_id'))}.json` : 'api/candidates/latest.json');
+    const min = q.get('min_score') === null || q.get('min_score') === '' ? null : Number(q.get('min_score'));
+    const v = q.get('verdict');
+    if (v || min !== null) d.candidates = (d.candidates || []).filter((c) => (!v || c.verdict === v) && (min === null || (isNum(c.score) && c.score >= min)));
+    return d;
+  }
+  if (seg[0] === 'candidates' && seg.length === 2) {
+    let sid = q.get('scan_id');
+    if (!sid) { const l = await file('api/candidates/latest.json'); sid = l.scan && l.scan.id; }
+    if (sid === null || sid === undefined) { const e = new Error('404 no completed scans yet'); e.status = 404; throw e; }
+    return file(`api/candidates/${encodeURIComponent(sid)}/${encodeURIComponent(safeName(seg[1]))}.json`);
+  }
+  return file('api/' + seg.map(encodeURIComponent).join('/') + '.json');
+}
+
 async function api(path, opts) {
+  if (STATIC) {
+    if (opts && opts.method && opts.method.toUpperCase() !== 'GET') {
+      const e = new Error('This page is a read-only snapshot. Start scans and experiments on GitHub.');
+      e.status = 405;
+      throw e;
+    }
+    return staticGet(path);
+  }
   const res = await fetch(path, opts);
   if (!res.ok) {
     let detail = '', raw;
@@ -80,10 +135,11 @@ function renderTopbar() {
   $('#topbar-right').innerHTML = `
     <span class="muted">Last scan: <b>${last}</b>${h && h.ai_enabled === false ? ' · AI off' : ''}</span>
     ${state.scans.length ? `<label class="muted">Scan date <select id="scan-select" aria-label="Scan date">${opts}</select></label>` : ''}
-    <button class="primary" id="run-btn" ${state.running ? 'disabled' : ''}>${state.running ? 'Scan running…' : 'Run scan'}</button>`;
+    ${STATIC ? (ghLink('Start on GitHub', 'scan.yml', 'primary') || '<span class="muted">Read-only snapshot</span>')
+      : `<button class="primary" id="run-btn" ${state.running ? 'disabled' : ''}>${state.running ? 'Scan running…' : 'Run scan'}</button>`}`;
   const sel = $('#scan-select');
   if (sel) sel.onchange = () => { state.scanId = sel.value; if (location.hash.startsWith('#/t/')) location.hash = '#/'; else render(); };
-  $('#run-btn').onclick = startScan;
+  if (!STATIC) $('#run-btn').onclick = startScan;
 }
 
 function setBanner(st) {
@@ -136,6 +192,7 @@ async function loadMeta(selectNewest) {
   const [h, s] = await Promise.allSettled([api('/api/health'), api('/api/scans')]);
   state.health = h.status === 'fulfilled' ? h.value : null;
   state.scans = s.status === 'fulfilled' && Array.isArray(s.value) ? s.value : [];
+  if (STATIC && Array.isArray(STATIC.scan_ids)) state.scans = state.scans.filter((x) => STATIC.scan_ids.includes(x.id)); // only scans with exported candidate files
   if (selectNewest || !state.scans.some((x) => String(x.id) === String(state.scanId))) state.scanId = state.scans[0]?.id ?? null;
   renderTopbar();
 }
@@ -196,7 +253,8 @@ async function viewList(token) {
   if (!state.scans.length || state.scanId === null) {
     app.innerHTML = `<div class="panel empty"><h2>No scans yet</h2>
       <p>TradeAlert scans the US penny-stock universe, scores each candidate for spike potential and flags the risks.</p>
-      <p>Press <b>Run scan</b> in the top right to run your first scan. It can take a few minutes; progress shows at the top of the page.</p></div>`;
+      ${STATIC ? `<p>No scan has been published yet. Run the <b>Daily scan</b> workflow on GitHub (Actions tab), then this page updates itself.</p>${ghLink('Start on GitHub', 'scan.yml', 'primary big')}`
+        : '<p>Press <b>Run scan</b> in the top right to run your first scan. It can take a few minutes; progress shows at the top of the page.</p>'}</div>`;
     return;
   }
   const data = await api(`/api/candidates?scan_id=${encodeURIComponent(state.scanId)}`);
@@ -492,6 +550,11 @@ function expCard(e) {
     ${body}</article>`;
 }
 
+function newExpButton() {
+  return STATIC ? (ghLink('Start on GitHub', 'experiment.yml', 'primary big') || '<span class="muted">Start experiments from the repository Actions tab</span>')
+    : '<button class="primary big" data-new-exp>New experiment</button>';
+}
+
 function emptyExperiments() {
   return `<div class="panel empty"><h2>No experiments yet</h2>
     <p>Experiments test whether TradeAlert's picks are any good, by comparing them with all penny stocks on the same days.</p>
@@ -499,13 +562,13 @@ function emptyExperiments() {
       <div><b>History run</b><p>Replays the scanner over a past date range and measures what its picks did afterwards. Quick, but uses hindsight data.</p></div>
       <div><b>Forward test</b><p>Freezes today's predictions, waits (5 trading days by default), then marks each one right or wrong. Slower, but no hindsight.</p></div>
     </div>
-    <p><button class="primary big" data-new-exp>New experiment</button></p></div>`;
+    <p>${newExpButton()}</p></div>`;
 }
 
 async function viewExperiments(token) {
   app.innerHTML = `<div class="page-head"><div><h2 style="margin:0">Experiments</h2>
       <p class="note" style="margin:2px 0 0">Is the tool's advice any good? Each experiment compares its picks with all penny stocks on the same days.</p></div>
-      <button class="primary big" data-new-exp>New experiment</button></div>
+      ${newExpButton()}</div>
     <div id="exp-list"><p class="muted">Loading…</p></div>`;
   app.querySelectorAll('[data-new-exp]').forEach((b) => { b.onclick = () => openNewExperiment(); });
   let last = null;
@@ -908,7 +971,7 @@ function drawExperiment(d, token) {
   let status = '';
   if (d.status === 'running') status = `<div class="panel"><h2>In progress</h2>${progressBar(d.progress)}<p class="muted" style="margin:8px 0 0">${esc(d.message) || 'Working…'}${isNum(d.progress) ? ` (${Math.round(d.progress * 100)}%)` : ''} This page updates by itself.</p></div>`;
   else if (d.status === 'failed') status = `<div class="error"><b>This experiment failed.</b><div>${esc(d.error || d.message) || 'No error message was recorded.'}</div></div>`;
-  else if (d.status === 'waiting') status = `<div class="panel callout"><b>Waiting for results.</b> The predictions are frozen. They will be scored after <b>${fmt.date(d.due_date)}</b>; the app must be running then. Rows marked "In progress" show the price so far. ${d.message ? esc(d.message) : ''}</div>`;
+  else if (d.status === 'waiting') status = `<div class="panel callout"><b>Waiting for results.</b> The predictions are frozen. They will be scored after <b>${fmt.date(d.due_date)}</b>; ${STATIC ? 'the next daily scan on GitHub settles them.' : 'the app must be running then.'} Rows marked "In progress" show the price so far. ${d.message ? esc(d.message) : ''}</div>`;
 
   const noNumbers = d.status === 'waiting' && !(isNum(o.evaluated) && o.evaluated > 0);
   const cmp = hasSummary && !noNumbers && d.status !== 'running' && d.status !== 'failed' ? `
@@ -929,8 +992,9 @@ function drawExperiment(d, token) {
       <div><h1>${esc(expName(d))}</h1><div class="sub">${esc(kindLabel(d.kind))} · Created ${fmt.dt(d.created_at)}${d.finished_at ? ` · Finished ${fmt.dt(d.finished_at)}` : ''}${d.status === 'waiting' ? ` · Due ${fmt.date(d.due_date)}` : ''}</div></div>
       ${statusBadge(d.status)}${verdictChip(v)}
       <div class="exp-actions">
-        ${d.status === 'waiting' && d.kind === 'forward' ? '<button class="primary" id="x-check">Check results now</button>' : ''}
-        <button class="danger-o" id="x-del" ${d.status === 'running' ? 'disabled title="Cannot delete while running"' : ''}>Delete</button>
+        ${STATIC ? '' : `${d.status === 'waiting' && d.kind === 'forward' ? '<button class="primary" id="x-check">Check results now</button>' : ''}
+        <button class="danger-o" id="x-del" ${d.status === 'running' ? 'disabled title="Cannot delete while running"' : ''}>Delete</button>`}
+        ${STATIC ? ghLink('Start on GitHub', d.status === 'waiting' && d.kind === 'forward' ? 'scan.yml' : 'experiment.yml', 'primary') : ''}
       </div>
     </div>
     <div id="x-err" class="error" role="alert" hidden></div>
@@ -954,7 +1018,7 @@ function drawExperiment(d, token) {
     try { const nd = await api(`/api/experiments/${encodeURIComponent(d.id)}/evaluate`, { method: 'POST' }); if (token === renderToken) drawExperiment(nd, token); }
     catch (e) { if (token !== renderToken) return; chk.disabled = false; chk.textContent = 'Check results now'; err(`Could not check results: ${detailText(e)}`); }
   };
-  $('#x-del').onclick = async () => {
+  if (!STATIC) $('#x-del').onclick = async () => {
     if (!(await confirmDialog(`Delete "${expName(d)}"? This removes the experiment and all of its picks.`, 'Delete'))) return;
     try { await api(`/api/experiments/${encodeURIComponent(d.id)}`, { method: 'DELETE' }); location.hash = '#/experiments'; }
     catch (e) { err(e.status === 409 ? 'This experiment is still running and cannot be deleted yet.' : `Could not delete: ${detailText(e)}`); }
@@ -981,9 +1045,20 @@ async function viewExperiment(id, token) {
   drawExperiment(d, token);
 }
 
+function renderStaticNote() {
+  const el = $('#run-banner');
+  el.hidden = false;
+  el.classList.add('static-note');
+  const when = STATIC.generated_at ? fmt.dt(STATIC.generated_at) : 'an unknown time';
+  const actions = ghUrl('');
+  el.innerHTML = `<b>Read-only snapshot</b> generated ${esc(when)}. Scans and experiments run on GitHub Actions and this page is rebuilt afterwards${actions ? ` · ${ghLink('Open Actions on GitHub', '')} · ${ghLink('Run scan', 'scan.yml')} · ${ghLink('New experiment', 'experiment.yml')}` : ''}.`;
+}
+
 /* ---------- boot ---------- */
 (async function boot() {
+  if (STATIC) renderStaticNote();
   await loadMeta(true);
   render();
+  if (STATIC) return;
   try { const st = await api('/api/scans/status'); if (st.running) { setBanner(st); pollScan(); } } catch {}
 })();

@@ -1,0 +1,145 @@
+name: Experiment
+
+on:
+  workflow_dispatch:
+    inputs:
+      kind:
+        description: "backtest replays history (about 10 min); forward freezes the latest scan's picks"
+        type: choice
+        options: [backtest, forward]
+        default: backtest
+      name:
+        description: "Name (optional)"
+        required: false
+        default: ""
+      start_date:
+        description: "Backtest start, YYYY-MM-DD (blank = CLI default)"
+        required: false
+        default: ""
+      end_date:
+        description: "Backtest end, YYYY-MM-DD (blank = CLI default)"
+        required: false
+        default: ""
+      horizon_days:
+        description: "Trading days to hold (blank = default 5)"
+        required: false
+        default: ""
+      hit_threshold_pct:
+        description: "Hit threshold in percent (blank = default 20)"
+        required: false
+        default: ""
+      top_n:
+        description: "Backtest: picks per day (blank = default 10)"
+        required: false
+        default: ""
+      min_score:
+        description: "Minimum score (blank = default)"
+        required: false
+        default: ""
+      entry:
+        description: "Entry price (default = CLI default)"
+        type: choice
+        options: [default, next_open, close]
+        default: default
+
+concurrency:
+  group: tradealert-data
+  cancel-in-progress: false
+
+permissions: {}
+
+env:
+  PYTHONUNBUFFERED: "1"
+  SEC_USER_AGENT: ${{ vars.SEC_USER_AGENT || secrets.SEC_USER_AGENT || 'TradeAlert research tool tradealert-noreply@users.noreply.github.com' }}
+
+jobs:
+  experiment:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: write   # only to force-push the `data` branch
+    outputs:
+      exported: ${{ steps.export.outputs.exported }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Restore database from the data branch
+        run: .github/scripts/restore-db.sh
+      - name: Restore price cache
+        uses: actions/cache@v4
+        with:
+          path: data/cache
+          key: tradealert-cache-${{ github.run_id }}
+          restore-keys: tradealert-cache-
+      - name: Run experiment
+        id: exp
+        continue-on-error: true
+        env:
+          # inputs go through env, never interpolated into the script
+          INPUT_KIND: ${{ inputs.kind }}
+          INPUT_NAME: ${{ inputs.name }}
+          INPUT_START: ${{ inputs.start_date }}
+          INPUT_END: ${{ inputs.end_date }}
+          INPUT_HORIZON: ${{ inputs.horizon_days }}
+          INPUT_HIT: ${{ inputs.hit_threshold_pct }}
+          INPUT_TOP_N: ${{ inputs.top_n }}
+          INPUT_MIN_SCORE: ${{ inputs.min_score }}
+          INPUT_ENTRY: ${{ inputs.entry }}
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+        run: |
+          args=("$INPUT_KIND")
+          add() { if [ -n "$2" ]; then args+=("$1" "$2"); fi; }
+          if [ "$INPUT_KIND" = "backtest" ]; then
+            add --start "$INPUT_START"; add --end "$INPUT_END"; add --top-n "$INPUT_TOP_N"
+          elif [ -n "$INPUT_START$INPUT_END$INPUT_TOP_N" ]; then
+            echo "::notice::start_date, end_date and top_n only apply to backtests and are ignored."
+          fi
+          add --horizon "$INPUT_HORIZON"; add --hit "$INPUT_HIT"; add --min-score "$INPUT_MIN_SCORE"
+          add --name "$INPUT_NAME"
+          if [ "$INPUT_ENTRY" != "default" ]; then add --entry "$INPUT_ENTRY"; fi
+          python run.py experiment "${args[@]}"
+      - name: Save database to the data branch
+        if: ${{ always() }}
+        run: .github/scripts/save-db.sh
+      - name: Export static site
+        id: export
+        if: ${{ always() }}
+        run: |
+          python run.py export-site --out _site
+          echo "exported=true" >> "$GITHUB_OUTPUT"
+      - name: Upload site artifact
+        if: ${{ always() && steps.export.outputs.exported == 'true' }}
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - name: Fail the run if the experiment failed
+        if: ${{ steps.exp.outcome == 'failure' }}
+        run: |
+          echo "::error::The experiment failed (see the 'Run experiment' step). The database and site were still saved."
+          exit 1
+
+  deploy:
+    needs: experiment
+    if: ${{ always() && needs.experiment.outputs.exported == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        continue-on-error: true
+        uses: actions/deploy-pages@v4
+      - name: Explain a failed deploy
+        if: ${{ steps.deployment.outcome == 'failure' }}
+        run: |
+          echo "::error::Pages deploy failed. Enable Pages first: repository Settings > Pages > Build and deployment > Source: GitHub Actions. The database was already saved; re-run this workflow afterwards."
+          exit 1
